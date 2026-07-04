@@ -1,0 +1,170 @@
+\section{Method}
+\label{sec:method}
+
+Figure~\ref{fig:architecture} gives an overview of MedAlign-RAG. A query is
+served by two retrieval paths whose budget is allocated by a density-aware
+router; the mixed candidate pool is ordered by an off-the-shelf reranker and
+then passed to a vision-language agent that judges the value of each candidate
+and either accepts the evidence for generation or rewrites the query and
+re-retrieves. The agent is trained by reinforcement learning against an
+answer-utility reward. Once accepted, the selected image--text evidence is fed,
+unaltered, to a vision-language generator.
+
+\begin{figure*}[t]
+  \centering
+  % \includegraphics[width=0.95\textwidth]{architecture.pdf}
+  \framebox[0.95\textwidth]{\rule{0pt}{4.2cm}\ Figure~2 placeholder (system architecture)}
+  \caption{MedAlign-RAG. Dual-path retrieval feeds a density-aware router that
+  allocates the text/image budget; the reranked pool is inspected by a
+  vision-language agent that judges each image and text candidate and either
+  accepts the evidence for generation or rewrites the query and re-retrieves
+  (closing the loop). The agent is trained by reinforcement learning against an
+  answer-utility reward---the lift in the frozen generator's probability of the
+  correct answer. Accepted image--text evidence is passed unaltered to the
+  generator.}
+  \label{fig:architecture}
+\end{figure*}
+
+\subsection{Problem Formulation and Evaluation Protocol}
+\label{sec:formulation}
+
+A query is a pair $x=(q, I_q)$, where $q$ is the question text (with answer
+options for multiple-choice QA) and $I_q$ is an optional query image. Given a
+text corpus $\mathcal{T}$ and an image corpus $\mathcal{V}$, a retriever returns
+a candidate pool $\mathcal{C}=\mathcal{C}_t\cup\mathcal{C}_i$ with
+$\mathcal{C}_t\subseteq\mathcal{T}$ and $\mathcal{C}_i\subseteq\mathcal{V}$. An
+agent selects an evidence set $E\subseteq\mathcal{C}$---not in one shot, but
+through iterative rounds of judging, generating, or reformulating and
+re-retrieving (Sec.~\ref{sec:selection})---and a vision-language generator $G$
+produces the answer
+\begin{equation}
+  \hat{a} = G\!\left(q, I_q, E\right).
+  \label{eq:generation}
+\end{equation}
+
+The distinction we stress is the \emph{form} of $E$ passed to $G$. Prior work
+adopts a \emph{text-proxy} protocol in which every image evidence $e\in E$ is
+replaced by its textual caption $\text{cap}(e)$, so $G$ receives text only.
+We instead adopt an \emph{end-to-end image--text} protocol in which the actual
+pixels of image evidence are passed to $G$. As we show empirically, the two
+protocols rank methods differently: text-proxy evaluation is blind to the
+quality of visual evidence and therefore misestimates reranking quality on
+image-dependent queries.
+
+\subsection{Dual-Path Retrieval}
+\label{sec:retrieval}
+
+The text path encodes $q$ with a text embedding model~\cite{chen2024bgem3} and
+searches $\mathcal{T}$ by inner product, returning the top $N_t$ passages. The
+image path encodes $I_q$ with the vision tower of a vision-language
+model~\cite{bai2023qwenvl} and searches $\mathcal{V}$, returning the top $N_i$
+images. Each candidate $c$ carries a first-stage score $s(c)$ from its own path.
+The union $\mathcal{C}$, with $|\mathcal{C}|\le N_t+N_i$, forms the input to
+reranking.
+
+\subsection{Density-Aware Modality Routing}
+\label{sec:routing}
+
+The retrieval budget should follow where a query's discriminative information
+lives---and, just as importantly, avoid a modality that only injects noise. A
+query phrased in generic or positional terms (\emph{``which anatomical site is
+shown''}) carries no discriminative textual signal; issued to the text path it
+retrieves same-site, different-pathology passages that flood the pool with
+homogeneous false positives. Routing must therefore be able not only to
+rebalance the two paths but to \emph{suppress} one of them.
+
+We predict two properties of $q$ with two lightweight classifiers sharing a
+Chinese BERT backbone. A \emph{textual density} head outputs
+$d=f_{\text{den}}(q)\in\{L_0,\dots,L_4\}$, from $L_0$ (vague, few localizable
+cues) to $L_4$ (highly specific, multiple explicit constraints). An
+\emph{image-dependency} head outputs $r=f_{\text{dep}}(q)\in\{R_1,R_2,R_3\}$,
+from $R_1$ (text usually suffices) to $R_3$ (the image is indispensable).
+
+Given a total budget $B=N_t+N_i$, the router allocates the image share through a
+monotone function $\phi$ that increases with image dependency and decreases with
+textual density,
+\begin{equation}
+  N_i = \big\lceil B\cdot\phi(d, r)\big\rceil,\qquad N_t = B - N_i,
+  \label{eq:budget}
+\end{equation}
+and produces a fusion weight $w\in[0,1]$ that biases the reranker toward the
+trusted modality. Routing is re-run on every retrieval round, so a query
+reformulated by the agent (Sec.~\ref{sec:selection}) is re-budgeted from its new
+text. Crucially, $\phi$ saturates: a
+low-density, image-critical query ($L_0,R_3$) drives $N_t\!\to\!0$ and
+$w\!\to\!1$, gating off the noisy text path, whereas a text-answerable query
+($L_4,R_1$) drives $N_i\!\to\!0$, avoiding spurious visual matches. Unlike a
+fixed fusion weight, routing can thus withdraw a modality entirely when its
+signal is noise rather than evidence.
+
+\subsection{Agentic Cross-Modal Evidence Selection}
+\label{sec:selection}
+
+Rather than take the reranker's top $K$ as final, we treat evidence selection as
+a sequential decision problem solved by a vision-language agent $\pi$. The agent
+sees the actual pixels of image candidates and the text of passage candidates,
+judges which ones are worth keeping, and---when the pool is inadequate---rewrites
+the query and retrieves again. It is trained so that the evidence it keeps
+maximizes the generator's chance of answering correctly, rather than surface
+relevance.
+
+\paragraph{Initial ordering.}
+The mixed pool $\mathcal{C}$ is first ordered by an off-the-shelf multimodal
+reranker, using the fusion weight $w$ from routing to bias the ranking toward the
+trusted modality. This ordering is only a prior; the agent, not the reranker,
+decides what is used.
+
+\paragraph{Agent policy.}
+The policy $\pi_\theta$ is a small vision-language model that ingests the query
+$(q,I_q)$ and the ranked candidates---image candidates as pixels, so visual
+content is judged directly rather than through captions---and, at each round
+$t$, emits an action $a_t$:
+\begin{equation}
+  a_t \sim \pi_\theta\!\left(\cdot \mid q, I_q, \mathcal{C}^{(t)}, E^{(t)}\right),
+  \label{eq:policy}
+\end{equation}
+where $a_t$ either (i)~\emph{selects} candidates into the running evidence set
+$E^{(t)}$, (ii)~\emph{accepts} $E^{(t)}$ and stops, or (iii)~\emph{rewrites} the
+query to $q^{(t+1)}$, triggering a fresh retrieval round (through routing,
+Sec.~\ref{sec:routing}) that refreshes the pool $\mathcal{C}^{(t+1)}$. Rewriting
+gives the system a recourse absent from one-shot rerankers: a pool of
+same-site, different-pathology false positives can be discarded and replaced by
+a more discriminative query. The loop runs until the agent accepts or a round
+budget $T$ is reached.
+
+\paragraph{Answer-utility reward.}
+The agent is rewarded by how much the accepted evidence improves the frozen
+generator's confidence in the correct answer. For a multiple-choice query with
+gold answer token $a^\star$, let $P_G(a^\star \mid q, I_q, E)$ be the generator's
+probability of $a^\star$ given evidence $E$. The reward is the utility
+\emph{lift} over answering with no evidence,
+\begin{equation}
+  R(E) = P_G\!\left(a^\star \mid q, I_q, E\right)
+       - P_G\!\left(a^\star \mid q, I_q, \varnothing\right).
+  \label{eq:reward}
+\end{equation}
+The second term is a per-query baseline that measures how much the generator
+already knows closed-book, so the agent is credited only for evidence that
+genuinely helps. Because $R$ is read from the generator's answer distribution, it
+needs \emph{no passage-level relevance labels}---the multiple-choice answer is
+the only supervision. Evidence that is topically related but useless yields no
+lift, and confidently-wrong homogeneous-image matches, which pull probability
+toward a distractor, are penalized---directly targeting~(P2).
+
+\paragraph{Training.}
+We optimize $\theta$ with policy-gradient reinforcement learning, maximizing the
+expected reward $\mathbb{E}_{a_{1:T}\sim\pi_\theta}\!\left[R(E)\right]$ over
+sampled trajectories, with the generator $G$ frozen throughout so the reward
+reflects evidence quality alone. Because the reward is defined on the end-to-end
+image--text answer distribution, training \emph{requires} the corrected
+evaluation protocol (Sec.~\ref{sec:formulation}): under a text-proxy protocol the
+generator never sees image evidence, and the utility signal that drives learning
+would be blind to it.
+
+\subsection{Multimodal Generation}
+\label{sec:generation}
+
+The selected set $E$---original image pixels together with text passages---is
+provided to the vision-language generator following Eq.~\ref{eq:generation}. No
+image is replaced by a caption, so visual evidence contributes directly to the
+answer.

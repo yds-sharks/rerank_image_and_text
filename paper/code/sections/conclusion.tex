@@ -1,0 +1,25 @@
+\section{Conclusion}
+\label{sec:conclusion}
+
+We revisited evidence selection in multimodal medical RAG and argued that the
+prevailing recipe---score candidates for relevance and take the top $K$ in a
+single pass---is fundamentally passive: it conflates relevance with
+answer-utility, offers no recourse when the retrieved pool is inadequate, and,
+on visually homogeneous medical images, systematically admits high-confidence
+but clinically wrong evidence. We recast selection as an \emph{agentic search}
+process. A vision-language agent judges image and text candidates cross-modally
+and either accepts them for generation or rewrites the query to re-retrieve,
+trained with an \emph{answer-utility reward}---the lift in a frozen generator's
+probability of the correct answer---which needs only multiple-choice supervision
+and no passage-level labels. A density-aware router allocates the retrieval
+budget on every round and can suppress a modality whose signal is noise, and we
+evaluate under a corrected end-to-end image--text protocol that feeds the
+retrieved images to the generator directly.
+
+Our framework has limits. The reward is a per-query answer-probability lift, so
+it presumes access to gold answers at training time and is most natural for
+multiple-choice supervision; extending answer-utility rewards to open-ended
+medical generation, and reducing the cost of iterative re-retrieval, are natural
+next steps. More broadly, we hope answer-utility--driven, cross-modal agentic
+retrieval proves useful beyond endoscopy---wherever visual similarity is a poor
+proxy for the evidence a model actually needs.

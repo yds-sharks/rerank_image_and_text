@@ -1,0 +1,46 @@
+\section{Related Work}
+\label{sec:related_work}
+
+\paragraph{Multimodal RAG.}
+Retrieval-augmented generation grounds language models in external
+evidence~\cite{lewis2020retrieval}. Multimodal variants retrieve images and text
+and generate over both~\cite{chen2022murag,yasunaga2023retrieval}. In practice,
+however, most pipelines convert retrieved images into captions and feed only text
+to the generator, so the model never sees the retrieved pixels. This text-proxy
+habit both caps performance on image-dependent questions and, as we show, hides
+the value of visual evidence from evaluation. MedAlign-RAG instead passes image
+evidence unaltered to the generator and makes this end-to-end signal the training
+target.
+
+\paragraph{Agentic and RL-based retrieval.}
+A recent line of work lets the model control retrieval: Self-RAG learns to decide
+when to retrieve and to critique its own generations~\cite{asai2024selfrag};
+Search-R1~\cite{jin2025searchr1} and R1-Searcher~\cite{song2025r1searcher} train
+LLMs to interleave reasoning with search queries via reinforcement learning;
+DeepRAG~\cite{guan2025deeprag} and iterative retrieval-generation
+schemes~\cite{shao2023iterretgen} reformulate and re-retrieve across steps; and
+REPLUG tunes retrieval to a black-box LM's likelihood~\cite{shi2024replug}. These
+methods are text-only, and their reward or supervision targets answer
+correctness, output format, or retrieval likelihood. MedAlign-RAG differs on
+three axes: the agent is \emph{cross-modal}, judging image pixels and text alike;
+its reward is the \emph{answer-utility lift} of the selected evidence over a
+closed-book baseline, isolating evidence quality from what the generator already
+knows; and it is aimed at the medical setting where visual homogeneity makes
+similarity-based selection actively harmful.
+
+\paragraph{Evidence reranking.}
+Second-stage rerankers refine first-stage recall with cross-encoders that score
+query--passage pairs~\cite{nogueira2019passage}, listwise LLM
+rankers~\cite{sun2023chatgpt}, or graph-based relevance propagation. They are
+passive and one-shot---candidates are scored for relevance and the top few are
+taken---and operate in a text-dominant space that treats images through captions.
+We replace this fixed step with an agent that judges evidence by its effect on
+the answer and can re-retrieve when the pool is inadequate.
+
+\paragraph{Medical VQA and benchmarks.}
+Medical vision-language models such as LLaVA-Med answer image questions
+closed-book~\cite{li2023llavamed}, without retrieval augmentation. EndoBench
+provides a large multiple-choice benchmark for endoscopic
+QA~\cite{endobench}, most of whose questions are image-dependent; we use it under
+a corrected image--text protocol to evaluate retrieval-augmented generation where
+visual evidence genuinely matters.

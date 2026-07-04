@@ -1,0 +1,14 @@
+# 进度表
+
+| 日期 | 做了什么 | 结果 | 问题 | 下一步 |
+|------|---------|------|------|--------|
+| 2026-07-01 | 初始化项目结构 | 完成三个子模块 + skill 框架 | 无 | 用户上传设计思路，配置 skill 内容 |
+| 2026-07-03 | clone 进度仓库 rerank_image_and_text 到 rerank_repo/，把 4 份设计文档适配进 design_docs/data/persistent/rerank_source/ | git 完好(origin=yds-sharks，已设 sslVerify false)；素材到位 | clone 初次误落 temp 已修正；本机 SSH 绑 yegcjs，push 需 yds-sharks 的 PAT | 梳理论文框架 |
+| 2026-07-03 | 梳理 AAAI 论文框架 outline.md v0.2 | 定稿三大机制痛点(对齐排序/密度门控/视觉相似≠临床相同)+3创新点(C1证据选择TBD/C2门控已实现/C3修正评测)；rerank结果留空 | rerank 三套方法(PPR/SEV/ODSC/VCMS)均未跑出正效果 | 定标题 + 选起手章节 |
+| 2026-07-03 | 定标题 MedAlign-RAG；下载 AAAI-26 官方 author kit 配置 LaTeX 骨架 | main.tex 用 aaai2026.sty(submission模式)，6章节stub+大纲脚手架就绪，结构自检通过 | 本机无 pdflatex，编译需在 Overleaf | 选起手章节开写(建议 Method门控 或 Intro) |
+| 2026-07-03 | **论文重大转向(pivot)→agentic search**：放弃子模 rerank 主贡献，改为 answer-utility RL 训练的 agentic 跨模态证据代理(判价值/accept 生成 or rewrite 重检索)。全篇重构 | 标题改 agentic 版；abstract(149词) / intro(痛点洗牌 P1=被动相似度非效用/insight/贡献) / method 3.4 整节替换(新 eq:policy+eq:reward，删子模三公式) / related_work 4 小节(agentic-RL 差异化) / experiments(加 agentic 基线+消融) 全部重写；references.bib 加 6 篇 agentic-RAG(标 VERIFY) | 旧子模方法(PPR/SEV/ODSC)实测无正收益是 pivot 主因；本机无 pdflatex 需 Overleaf 验证编译 | Overleaf 编译验证；作者审 3 决策(agent 底座=Qwen3-VL/通用RL表述/标题)后填结果 |
+| 2026-07-03 | 重画 Fig 2 为闭环 agentic 流水线 | figures_arch_medalign.py 渲染出 tmp/*.png+pdf：Query→双路检索(顶部密度路由)→Qwen rerank→证据代理(accept E→VLM 生成→答案；reject→rewrite 环)+训练期 reward 虚线反馈；无遮挡 | 无 | 定稿后移 persistent/ 并在 main.tex 换 \includegraphics |
+| 2026-07-03 | Fig 2 修遮挡/超框(用户反馈"过于简单+矢量遮挡+文字超框") | 加 fit_text() 按渲染宽度自动缩字、section_header() 把编号 badge 收进左上角不压边框、mark_keep/mark_drop 打勾叉；代理内加 4 候选判价值条(图/文 keep✓/drop✗)+reward 公式；删代理→生成间挤压的 accept E 冗余标签。重渲染无超框无遮挡 | 无 | 交作者审核；定稿移 persistent/ 换 \includegraphics |
+| 2026-07-03 | 写 Conclusion(编译路径最后一个 stub) | conclusion.tex 成文(~230词)：复述 agentic 重构+answer-utility reward+跨模态+密度路由+端到端评测，含 limitations/future work(奖励依赖 gold answer、迭代重检索成本、向开放式生成扩展)。一致性检查:无旧措辞残留、所有\ref有对应\label | results.tex/appendix.tex 是未\input的孤儿 stub(无害) | Overleaf 编译验证；结果出来填 Main Results |
+| 2026-07-04 | 设计 RL 训练+数据构造方案；勘察数据环境 | 确认: /mnt/data_1(语料库DB) 与 /mnt/data_10(全量 retrieval_export 6832行117M) 本会话均未挂载；HF/simula(HyperKvasir)联网超时被墙, GitHub/Kaggle通; 项目内仅 rerank_repo 3条样本。摸清 retrieval_export schema(sample{MCQ}+adaptive_fusion{路由}+retrieval{text/image_top20,含level1部位/level2类型/image_path}) | 全量数据取不到, 只能样本验证; export 的 sample 里【缺查询图路径】(RL 需 I_q, 须按 dataset+index 回连 EndoBench 源补) | 用户挂载数据/导出后跑全量; 定 API 与是否上公开集 |
+| 2026-07-04 | 写数据 pipeline 两脚本(三件套) | design_docs/code/design_docs_01_clean_queries.py(EndoBench清洗:校验/去重/派生query_text+路由+分层键+候选池) 样本3/3通过; design_docs_02_synth_mcq.py(源锚定合成:正确答案取真值标签,API只措辞,硬负例=同level1不同level2) fixture上验证硬负例B正常触发(食管4病理选1) | 玩具语料单部位单类型建不出干扰项,用 fixture 验证逻辑 | 全量语料到位后 --dry-run 关掉接真 API 造 5-10K, 硬负例占30-40% |

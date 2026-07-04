@@ -1,0 +1,107 @@
+\section{Introduction}
+\label{sec:introduction}
+
+Clinical diagnosis is inherently multimodal. When a gastroenterologist reads an
+endoscopic image, the judgment fuses two information streams: visual patterns
+(mucosal texture, lesion morphology, staining response) and textual knowledge
+(clinical guidelines, prior case descriptions). Automated medical question
+answering (QA) has begun to mirror this process, moving from closed-book
+vision-language models~\cite{li2023llavamed} toward retrieval-augmented
+generation (RAG)~\cite{lewis2020retrieval}, where external evidence is retrieved
+to ground the answer. In the multimodal setting the evidence is itself
+image--text: an ideal system retrieves relevant images \emph{and} text passages,
+then reasons over them jointly.
+
+Yet a blind spot pervades current multimodal medical RAG. Although images are
+retrieved, most pipelines convert them into textual
+surrogates---captions or descriptions---and feed only text to the
+generator~\cite{chen2022murag,yasunaga2023retrieval}; the generation model never
+actually sees the retrieved image. On EndoBench~\cite{endobench}, a large
+endoscopic QA benchmark, $84.5\%$ of questions are image-dependent. For these
+questions a text-proxy pipeline systematically hides the value of visual
+evidence, so any gain from better visual retrieval or reranking becomes
+invisible under evaluation. We argue that once the actual retrieved images are
+fed to the generator, the bottleneck of multimodal medical RAG shifts from
+recall to \emph{cross-modal evidence selection}: choosing, from a mixed pool of
+image and text candidates, the small set that best supports the answer.
+Figure~\ref{fig:motivation} illustrates this gap.
+
+This shift exposes three problems that existing methods do not address.
+
+\paragraph{(P1) Selection is passive, and relevance is not answer-utility.}
+Rerankers score each candidate for query relevance and take the top $K$ in a
+single pass. This has two consequences. First, relevance is only a proxy: a
+passage can be topically on-target yet contribute nothing to---or even distract
+from---answering the specific question, and a similarity score cannot separate
+the two. What ultimately matters is whether a piece of evidence raises the
+generator's chance of producing the correct answer. Second, the pass is
+one-shot: when the retrieved pool is poor, the system has no recourse. It cannot
+reformulate the query and search again, but must answer from whatever the first
+retrieval returned.
+
+\paragraph{(P2) In medicine, visual similarity does not imply clinical identity.}
+Endoscopic images are visually homogeneous: distinct pathologies at the same
+anatomical site appear nearly identical in pixel space. Pure similarity-based
+retrieval and top-$K$ selection consequently return confident but clinically
+wrong evidence---a failure mode largely absent from generic RAG. Effective
+selection must judge whether a candidate actually \emph{discriminates} the
+answer, not merely whether it looks similar.
+
+\paragraph{(P3) Low-discriminability text is a noise source, not merely a weak signal.}
+The discriminative content of a query is distributed unevenly across
+modalities, and, more sharply, some query text actively harms retrieval.
+Generic or positional phrasings---``which anatomical site is shown,'' ``what
+structure is this''---carry no discriminative retrieval signal; issued as a text
+query they pull in candidates that share the same site or structure but differ
+in pathology, systematically injecting homogeneous false positives. The problem
+is thus not only that a fixed fusion weight mis-balances the two paths, but that
+a modality can be worth \emph{suppressing}: retrieving more text can lower answer
+quality. Effective fusion must decide, per query, how much to trust each
+modality---and when to gate one off entirely.
+
+We present \textbf{MedAlign-RAG}, a multimodal medical RAG framework built on a
+single insight: recast fusion-stage evidence selection from maximizing
+query--candidate relevance into an \emph{agentic} decision process trained by
+downstream answer-utility. A vision-language agent inspects the reranked pool,
+judges the value of each image and text candidate in the generator's own visual
+space, and chooses between two actions: accept the evidence and generate, or
+rewrite the query and re-retrieve. The agent is trained by reinforcement
+learning whose reward is the increase in the (frozen) generator's probability of
+the correct answer once the selected evidence is supplied---a signal available
+directly from multiple-choice supervision, requiring no passage-level
+annotation. A density-aware modality router allocates the text/image retrieval
+budget on every round and suppresses a modality whose signal is noise.
+
+Our contributions are:
+\begin{itemize}
+  \item We recast multimodal evidence selection as an \emph{agentic search}
+  process and train a vision-language agent with an \emph{answer-utility
+  reward}---the lift in the generator's probability of the correct answer---so
+  evidence is optimized for its effect on the answer rather than for surface
+  relevance, using only multiple-choice supervision and no passage-level labels.
+  \item The agent operates \emph{cross-modally}, judging image and text
+  candidates alike and, when the pool is inadequate, rewriting the query to
+  re-retrieve; this recovers from poor first-stage retrieval and directly targets
+  the visually-homogeneous false positives characteristic of medical images.
+  \item We propose \emph{density-aware modality routing}, which predicts a
+  query's textual density and image dependency to allocate---and, when a modality
+  is noise, suppress---the retrieval budget across the text and image paths on
+  every retrieval round.
+  \item We identify an \emph{evaluation blind spot} in multimodal medical
+  RAG---retrieving images but generating from text alone---and evaluate
+  MedAlign-RAG on EndoBench under a corrected end-to-end image--text protocol,
+  comparing against no-retrieval, top-$K$, cross-encoder, graph-based, and
+  agentic-RAG baselines.
+\end{itemize}
+
+\begin{figure}[t]
+  \centering
+  % \includegraphics[width=\columnwidth]{motivation.pdf}
+  \framebox[0.95\columnwidth]{\rule{0pt}{3.4cm}\ Figure~1 placeholder}
+  \caption{Motivation. Existing multimodal medical RAG retrieves images but
+  passes only their textual descriptions to the generator (text-proxy). Because
+  most medical queries are image-dependent, this hides the value of visual
+  evidence; feeding the actual retrieved images exposes cross-modal evidence
+  selection as the true bottleneck.}
+  \label{fig:motivation}
+\end{figure}

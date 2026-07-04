@@ -1,0 +1,16 @@
+\begin{abstract}
+Multimodal medical retrieval-augmented generation (RAG) still selects evidence
+passively: candidates are reranked by similarity and the top few are fed to the
+generator in one shot. This conflates \emph{relevance} with
+\emph{answer-utility}, offers no recourse when the retrieved pool is poor, and,
+in medicine, is misled by endoscopic images that are visually similar yet
+clinically distinct. We recast evidence selection as an \emph{agentic} decision
+process. A vision-language agent judges the value of each image and text
+candidate, then either accepts the evidence for generation or rewrites the query
+and re-retrieves. The reward is the increase in the generator's probability of
+the correct answer once the selected evidence is provided---computable from
+multiple-choice supervision alone, with no passage-level labels. A density-aware
+router allocates the text/image retrieval budget on every round and suppresses a
+modality when its signal is noise. We evaluate on EndoBench under a corrected
+end-to-end image--text protocol (results TBD).
+\end{abstract}

@@ -1,0 +1,86 @@
+\section{Experiments}
+\label{sec:experiments}
+
+\subsection{Setup}
+\label{sec:setup}
+We evaluate on EndoBench~\cite{endobench}, a multiple-choice endoscopic QA
+benchmark of $6{,}832$ questions, of which $84.5\%$ are image-only, $15.3\%$
+image--text, and $0.1\%$ text-only. The text corpus and image corpus are indexed
+separately; dual-path retrieval returns the top candidates from each path, which
+routing re-budgets per query and an off-the-shelf multimodal reranker orders. The
+agent policy is a small vision-language model; the generator is a frozen
+vision-language model that receives image--text evidence directly. The agent is
+trained by policy-gradient reinforcement learning against the answer-utility
+reward (Eq.~\ref{eq:reward}) with the generator frozen, using only the
+benchmark's multiple-choice answers as supervision. We report multiple-choice
+accuracy overall and split by image-only vs.\ image--text queries.
+% Implementation details anonymized for submission.
+
+\subsection{Evaluation Blindness: Text-Proxy vs.\ Image--Text Input}
+\label{sec:blindspot}
+We first quantify the evaluation blind spot (C3): holding the retrieved evidence
+fixed, we compare feeding the generator textual captions of image evidence
+(text-proxy) against feeding the actual pixels (image--text). The gap, largest on
+image-dependent queries, measures how much visual evidence a text-proxy protocol
+hides. This experiment does not depend on the agent and can be run now
+(Table~\ref{tab:blindspot}).
+
+\begin{table}[t]
+  \centering
+  \begin{tabular}{lccc}
+    \toprule
+    Input to generator & Image-only & Image--text & Overall \\
+    \midrule
+    Text-proxy (captions) & -- & -- & -- \\
+    Image--text (pixels)  & -- & -- & -- \\
+    \bottomrule
+  \end{tabular}
+  \caption{Evaluation blindness (C3): accuracy under text-proxy vs.\ end-to-end
+  image--text input, evidence held fixed. \emph{TBD.}}
+  \label{tab:blindspot}
+\end{table}
+
+\subsection{Main Results}
+\label{sec:main}
+Table~\ref{tab:main} compares MedAlign-RAG against no-retrieval (closed-book),
+top-$K$ retrieval, a cross-encoder reranker~\cite{nogueira2019passage}, a
+graph-based reranker, and agentic-RAG baselines adapted to the multimodal
+setting~\cite{asai2024selfrag,jin2025searchr1,shao2023iterretgen}, all under the
+corrected image--text protocol. \emph{Results TBD.}
+
+\begin{table*}[t]
+  \centering
+  \begin{tabular}{lccc}
+    \toprule
+    Method & Image-only & Image--text & Overall \\
+    \midrule
+    No retrieval (closed-book)       & -- & -- & -- \\
+    Top-$K$ retrieval                & -- & -- & -- \\
+    Cross-encoder rerank~\cite{nogueira2019passage} & -- & -- & -- \\
+    Graph-based rerank               & -- & -- & -- \\
+    Self-RAG (multimodal)~\cite{asai2024selfrag}    & -- & -- & -- \\
+    Search-R1 (multimodal)~\cite{jin2025searchr1}   & -- & -- & -- \\
+    Iter-RetGen (multimodal)~\cite{shao2023iterretgen} & -- & -- & -- \\
+    \midrule
+    MedAlign-RAG (ours)              & -- & -- & -- \\
+    \bottomrule
+  \end{tabular}
+  \caption{Main results on EndoBench under the corrected image--text protocol.
+  \emph{TBD.}}
+  \label{tab:main}
+\end{table*}
+
+\subsection{Ablation Study}
+\label{sec:ablation}
+We ablate the agent's components: (i)~value judgment on/off (accept the
+reranker's top $K$ vs.\ let the agent select); (ii)~query rewriting and
+re-retrieval on/off; (iii)~reward design (answer-utility lift vs.\ a
+relevance/format reward); (iv)~maximum round budget $T$; and (v)~density-aware
+routing on/off. \emph{Results TBD.}
+
+\subsection{Analysis}
+\label{sec:analysis}
+We present case studies including a visual-similarity false positive that
+similarity-based selection accepts but the agent rejects, and a query the agent
+rewrites to recover from a poor initial pool; plus the distribution of rounds
+used and of selected-evidence modality across query types. \emph{Results TBD.}

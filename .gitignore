@@ -1,0 +1,34 @@
+# --- secrets (NEVER commit) ---
+.claude/settings.local.json
+*.env
+.env
+*credential*
+*secret*
+*token*
+*.pem
+*.key
+id_rsa*
+
+# --- nested clone of another project (has its own remote) ---
+rerank_repo/
+
+# --- python ---
+__pycache__/
+*.pyc
+*.pyo
+
+# --- draft/temp data (regenerable) ---
+data/tmp/
+*/data/tmp/
+**/data/tmp/
+
+# --- LaTeX build artifacts ---
+*.aux
+*.log
+*.synctex.gz
+*.bbl
+*.blg
+*.fdb_latexmk
+*.fls
+*.out
+*.toc
