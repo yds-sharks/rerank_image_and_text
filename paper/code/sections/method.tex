@@ -12,8 +12,9 @@ unaltered, to a vision-language generator.
 
 \begin{figure*}[t]
   \centering
-  % \includegraphics[width=0.95\textwidth]{architecture.pdf}
-  \framebox[0.95\textwidth]{\rule{0pt}{4.2cm}\ Figure~2 placeholder (system architecture)}
+  \IfFileExists{figures/fig2_architecture.pdf}{%
+    \includegraphics[width=0.95\textwidth]{fig2_architecture.pdf}}{%
+    \framebox[0.95\textwidth]{\rule{0pt}{4.2cm}\ Figure~2 placeholder (system architecture)}}
   \caption{MedAlign-RAG. Dual-path retrieval feeds a density-aware router that
   allocates the text/image budget; the reranked pool is inspected by a
   vision-language agent that judges each image and text candidate and either

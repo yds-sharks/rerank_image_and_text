@@ -5,16 +5,25 @@
 \label{sec:setup}
 We evaluate on EndoBench~\cite{endobench}, a multiple-choice endoscopic QA
 benchmark of $6{,}832$ questions, of which $84.5\%$ are image-only, $15.3\%$
-image--text, and $0.1\%$ text-only. The text corpus and image corpus are indexed
-separately; dual-path retrieval returns the top candidates from each path, which
-routing re-budgets per query and an off-the-shelf multimodal reranker orders. The
-agent policy is a small vision-language model; the generator is a frozen
-vision-language model that receives image--text evidence directly. The agent is
-trained by policy-gradient reinforcement learning against the answer-utility
-reward (Eq.~\ref{eq:reward}) with the generator frozen, using only the
-benchmark's multiple-choice answers as supervision. We report multiple-choice
-accuracy overall and split by image-only vs.\ image--text queries.
-% Implementation details anonymized for submission.
+image--text, and $0.1\%$ text-only. Retrieval draws on two separately indexed
+corpora: a text corpus of $517{,}717$ passages encoded with a multilingual
+text embedder~\cite{chen2024bgem3} and an image corpus of $66{,}291$ endoscopic
+images encoded with the vision tower of a vision-language
+model~\cite{bai2023qwenvl}. Dual-path retrieval returns the top $20$ candidates
+from each path; a density-aware router re-budgets the two paths per query
+(Sec.~\ref{sec:routing}) and an off-the-shelf multimodal reranker orders the
+merged pool. The router is a lightweight dual-head classifier over a shared
+Chinese BERT backbone. The agent policy is a small vision-language model that
+reads image candidates as pixels; the generator is a \emph{frozen}
+vision-language model that likewise receives image--text evidence directly. The
+agent is trained by policy-gradient reinforcement learning against the
+answer-utility reward (Eq.~\ref{eq:reward}) with the generator frozen, using only
+the benchmark's multiple-choice answers as supervision; we warm-start the policy
+by rejection-sampling supervised fine-tuning on trajectories that achieve
+positive reward. The agent is capped at $T$ retrieval rounds, and we report
+multiple-choice accuracy overall and split by image-only vs.\ image--text
+queries.
+% Implementation details (exact model sizes, learning rate, $T$) to be filled.
 
 \subsection{Evaluation Blindness: Text-Proxy vs.\ Image--Text Input}
 \label{sec:blindspot}
@@ -72,11 +81,30 @@ corrected image--text protocol. \emph{Results TBD.}
 
 \subsection{Ablation Study}
 \label{sec:ablation}
-We ablate the agent's components: (i)~value judgment on/off (accept the
-reranker's top $K$ vs.\ let the agent select); (ii)~query rewriting and
-re-retrieval on/off; (iii)~reward design (answer-utility lift vs.\ a
+We ablate the agent's components (Table~\ref{tab:ablation}): (i)~value judgment
+on/off (accept the reranker's top $K$ vs.\ let the agent select); (ii)~query
+rewriting and re-retrieval on/off; (iii)~reward design (answer-utility lift vs.\ a
 relevance/format reward); (iv)~maximum round budget $T$; and (v)~density-aware
 routing on/off. \emph{Results TBD.}
+
+\begin{table}[t]
+  \centering
+  \begin{tabular}{lccc}
+    \toprule
+    Configuration & Image-only & Image--text & Overall \\
+    \midrule
+    MedAlign-RAG (full)              & -- & -- & -- \\
+    \midrule
+    $-$ value judgment (top-$K$)     & -- & -- & -- \\
+    $-$ rewrite \& re-retrieve       & -- & -- & -- \\
+    \; reward: relevance/format      & -- & -- & -- \\
+    $-$ density-aware routing        & -- & -- & -- \\
+    \bottomrule
+  \end{tabular}
+  \caption{Ablation on EndoBench under the corrected image--text protocol.
+  Each row removes or replaces one component of the full model. \emph{TBD.}}
+  \label{tab:ablation}
+\end{table}
 
 \subsection{Analysis}
 \label{sec:analysis}

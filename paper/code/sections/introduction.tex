@@ -96,8 +96,9 @@ Our contributions are:
 
 \begin{figure}[t]
   \centering
-  % \includegraphics[width=\columnwidth]{motivation.pdf}
-  \framebox[0.95\columnwidth]{\rule{0pt}{3.4cm}\ Figure~1 placeholder}
+  \IfFileExists{figures/fig1_motivation.pdf}{%
+    \includegraphics[width=\columnwidth]{fig1_motivation.pdf}}{%
+    \framebox[0.95\columnwidth]{\rule{0pt}{3.4cm}\ Figure~1 placeholder (motivation)}}
   \caption{Motivation. Existing multimodal medical RAG retrieves images but
   passes only their textual descriptions to the generator (text-proxy). Because
   most medical queries are image-dependent, this hides the value of visual
