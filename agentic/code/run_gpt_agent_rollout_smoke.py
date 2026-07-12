@@ -1,34 +1,39 @@
 #!/usr/bin/env python3
-"""Two-sample GPT-agent rollout smoke for Stage 2/3.
+"""v0.3 GPT agent rollout smoke test.
 
-This script verifies that the full control path works:
-1. original low-information query -> retrieval/rerank
-2. GPT API rewrite agent -> ACCEPT/REWRITE + candidates
-3. each rewrite candidate -> retrieval/rerank
-4. reward + group advantage/loss-weight calculation
+Flow (per query):
+1. original query → retrieve → agent(keep/drop+ACCEPT/REWRITE)
+2. If REWRITE: rewrite query → retrieve again → agent again (up to max_rounds)
+3. For each round's action, measure P_G(a*|E) via generator logprobs
+4. Compute answer-utility reward = P_G(a*|E) - P_G(a*|∅)
+5. GRPO group advantage across all actions
 
-It intentionally supports `--no-ppr-rerank` for fast connectivity tests.
+No reranker. Retrieval results go directly to agent.
 """
 
 from __future__ import annotations
 
 import argparse
 import json
+import time
 from pathlib import Path
-from typing import Any, Dict, Iterable, List
+from typing import Any, Dict, Iterable, List, Optional, Set
 
-from gpt_agent_adapter import GPTRewriteAgent
-from rerank_adapter import NoOpReranker, PPRReranker
+from generator_adapter import OpenAICompatibleGenerator
+from gpt_agent_adapter import GPTAgent
 from retrieval_adapter import FirstStageRetriever, load_config
-from reward_model import attach_group_advantages, evidence_hit, score_candidate
+from reward_model import (
+    attach_group_advantages,
+    evidence_hit,
+    measure_p_correct,
+    score_answer_utility,
+)
 
-DEFAULT_INPUT = "/mnt/data_1/yds/多模态/agentic/outputs/mcq_image_v2_4000/agentic_image_mcq_4000.jsonl"
+DEFAULT_INPUT = "/mnt/data_1/yds/多模态/agentic/outputs/qa_gold_4000/qa_gold_4000.jsonl"
 DEFAULT_OUTPUT = "/mnt/data_1/yds/多模态/agentic/outputs/stage2_gpt_agent_smoke/rollout_rewards.jsonl"
 
 LOW_QUERY_BY_TYPE = {
-    "image_organ_identification": "这张图是什么部位？",
     "anatomical_site_recognition": "这张图是什么部位？",
-    "image_content_type_identification": "这张图主要展示什么？",
     "lesion_or_finding_identification": "图中是什么异常？",
     "procedure_or_operation_recognition": "图中在做什么操作？",
     "spatial_region_understanding": "图中异常在哪里？",
@@ -90,15 +95,19 @@ def select_rows(rows: Iterable[Dict[str, Any]], *, limit: int, query_type: str) 
     return selected
 
 
-def run_one_query(retriever: FirstStageRetriever, reranker: Any, query: str, image_path: str, *, topk: int, text_k: int, image_k: int) -> Dict[str, Any]:
-    retrieval = retriever.retrieve(query, image_path, text_k=text_k, image_k=image_k)
-    reranked = reranker.rerank(query, retrieval["combined"], select_k=topk)
-    return {
-        "query": query,
-        "retrieval_text": retrieval["text"],
-        "retrieval_image": retrieval["image"],
-        "reranked_evidence": reranked,
-    }
+def apply_keep_drop(evidence: List[Dict[str, Any]], keep: List[int]) -> List[Dict[str, Any]]:
+    return [evidence[i] for i in keep if 0 <= i < len(evidence)]
+
+
+def collect_ids(evidence: List[Dict[str, Any]], indices: List[int]) -> Set[str]:
+    ids: Set[str] = set()
+    for i in indices:
+        if 0 <= i < len(evidence):
+            item = evidence[i]
+            eid = item.get("sample_id") or item.get("doc_id") or ""
+            if eid:
+                ids.add(str(eid))
+    return ids
 
 
 def parse_args() -> argparse.Namespace:
@@ -108,12 +117,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--output-jsonl", default=DEFAULT_OUTPUT)
     parser.add_argument("--api-config", default="/mnt/data_1/yds/多模态/agentic/data_construction/api_config.local.json")
     parser.add_argument("--limit", type=int, default=2)
-    parser.add_argument("--query-type", default="image_organ_identification")
-    parser.add_argument("--text-k", type=int, default=8)
-    parser.add_argument("--image-k", type=int, default=8)
-    parser.add_argument("--topk", type=int, default=5)
-    parser.add_argument("--no-ppr-rerank", action="store_true")
-    parser.add_argument("--max-rewrites", type=int, default=2)
+    parser.add_argument("--query-type", default="")
+    parser.add_argument("--text-k", type=int, default=20)
+    parser.add_argument("--image-k", type=int, default=20)
+    parser.add_argument("--max-rounds", type=int, default=2)
     return parser.parse_args()
 
 
@@ -127,11 +134,13 @@ def main() -> None:
     if not rows:
         raise SystemExit("No usable smoke rows selected")
 
-    reranker = NoOpReranker(select_k=args.topk) if args.no_ppr_rerank else PPRReranker(config)
-    agent = GPTRewriteAgent(api_config_path=args.api_config)
+    agent = GPTAgent(api_config_path=args.api_config)
+    generator = OpenAICompatibleGenerator(config)
 
+    t0 = time.time()
     with FirstStageRetriever(config) as retriever, out_path.open("w", encoding="utf-8") as out:
         for idx, row in enumerate(rows):
+            t_row = time.time()
             qid = get_qid(row, idx)
             question = str(row.get("question") or "")
             options = get_options(row)
@@ -141,79 +150,99 @@ def main() -> None:
             original_query = get_original_query(row)
             gold = get_gold_source(row)
 
-            original = run_one_query(
-                retriever,
-                reranker,
-                original_query,
-                image_path,
-                topk=args.topk,
-                text_k=args.text_k,
-                image_k=args.image_k,
-            )
-            original_hit = evidence_hit(original["reranked_evidence"], gold_doc_id=gold["doc_id"], gold_page_idx=gold["page_idx"])
-
-            agent_output = agent.decide(
-                qid=qid,
-                query_type=str(row.get("query_type") or ""),
-                original_query=original_query,
-                question=question,
-                options=options,
-                evidence=original["reranked_evidence"],
-                image_path=image_path,
+            # Baseline: P_G(a*|∅)
+            p_baseline, _ = measure_p_correct(
+                generator, question=question, options=options, answer=answer,
+                query_image_path=image_path, evidence=None,
             )
 
+            # Run agent loop
+            query_text = original_query
+            suppressed_ids: Set[str] = set()
             candidate_records: List[Dict[str, Any]] = []
-            original_score = score_candidate(
-                original_hit=original_hit,
-                candidate_hit=original_hit,
-                query=original_query,
-                answer=answer,
-                answer_text=answer_text,
-                is_original=True,
-                agent_action=agent_output["action"],
-            )
-            candidate_records.append({
-                "candidate_id": "original",
-                "query": original_query,
-                "is_original": True,
-                "evidence_hit": bool(original_hit),
-                "reward": original_score["reward"],
-                "reward_components": original_score["components"],
-                "reranked_evidence": original["reranked_evidence"],
-            })
+            rounds_log: List[Dict[str, Any]] = []
 
-            rewrites = list(agent_output.get("rewrite_candidates") or [])[: max(args.max_rewrites, 0)]
-            for ridx, rewrite_query in enumerate(rewrites, start=1):
-                rewritten = run_one_query(
-                    retriever,
-                    reranker,
-                    rewrite_query,
-                    image_path,
-                    topk=args.topk,
-                    text_k=args.text_k,
-                    image_k=args.image_k,
+            for round_idx in range(args.max_rounds + 1):
+                retrieval = retriever.retrieve(
+                    query_text, image_path,
+                    text_k=args.text_k, image_k=args.image_k,
+                    exclude_ids=suppressed_ids,
                 )
-                rewrite_hit = evidence_hit(rewritten["reranked_evidence"], gold_doc_id=gold["doc_id"], gold_page_idx=gold["page_idx"])
-                score = score_candidate(
-                    original_hit=original_hit,
-                    candidate_hit=rewrite_hit,
-                    query=rewrite_query,
+                evidence = retrieval["combined"]
+
+                agent_out = agent.decide(
+                    qid=qid,
+                    query_type=str(row.get("query_type") or ""),
+                    original_query=original_query if round_idx == 0 else query_text,
+                    question=question,
+                    options=options,
+                    evidence=evidence,
+                    image_path=image_path,
+                )
+
+                kept = apply_keep_drop(evidence, agent_out["keep"])
+                dropped_ids = collect_ids(evidence, agent_out["drop"])
+                suppressed_ids |= dropped_ids
+                suppressed_ids |= collect_ids(evidence, agent_out["keep"])
+
+                # Measure P_G(a*|kept evidence)
+                p_with_kept, _ = measure_p_correct(
+                    generator, question=question, options=options, answer=answer,
+                    query_image_path=image_path, evidence=kept,
+                )
+
+                # Offline analysis: evidence_hit (not in reward)
+                hit = evidence_hit(kept, gold_doc_id=gold["doc_id"], gold_page_idx=gold["page_idx"])
+
+                original_utility = float(p_baseline) if round_idx == 0 else 0.0
+                score = score_answer_utility(
+                    p_correct_with_evidence=p_with_kept,
+                    p_correct_no_evidence=p_baseline,
+                    query=query_text,
                     answer=answer,
                     answer_text=answer_text,
-                    is_original=False,
-                    agent_action=agent_output["action"],
+                    is_original=(round_idx == 0 and agent_out["action"] == "ACCEPT"),
+                    agent_action=agent_out["action"],
+                    original_utility=original_utility,
                 )
+
+                cid = "original_accept" if round_idx == 0 else f"round_{round_idx}_{agent_out['action'].lower()}"
                 candidate_records.append({
-                    "candidate_id": f"rewrite_{ridx}",
-                    "query": rewrite_query,
-                    "is_original": False,
-                    "evidence_hit": bool(rewrite_hit),
+                    "candidate_id": cid,
+                    "action": agent_out["action"],
+                    "keep": agent_out["keep"],
+                    "drop": agent_out["drop"],
+                    "rewrite_query": agent_out.get("rewrite_query", ""),
+                    "query": query_text,
+                    "p_correct_with": p_with_kept,
+                    "p_correct_baseline": p_baseline,
                     "reward": score["reward"],
                     "reward_components": score["components"],
-                    "reranked_evidence": rewritten["reranked_evidence"],
+                    "evidence_hit": bool(hit),
+                    "num_kept": len(kept),
+                    "round": round_idx,
                 })
 
+                rounds_log.append({
+                    "round": round_idx,
+                    "query": query_text,
+                    "num_evidence": len(evidence),
+                    "keep": agent_out["keep"],
+                    "drop": agent_out["drop"],
+                    "action": agent_out["action"],
+                    "rewrite_query": agent_out.get("rewrite_query", ""),
+                    "p_correct_with": p_with_kept,
+                    "evidence_hit": bool(hit),
+                })
+
+                if agent_out["action"] == "ACCEPT" or round_idx >= args.max_rounds:
+                    break
+
+                query_text = agent_out.get("rewrite_query") or query_text
+
+            # GRPO group advantage
             reward_group = attach_group_advantages(candidate_records)
+
             record = {
                 "qid": qid,
                 "query_type": row.get("query_type"),
@@ -222,24 +251,25 @@ def main() -> None:
                 "answer": answer,
                 "answer_text": answer_text,
                 "query_image_path": image_path,
+                "original_query": original_query,
                 "gold_source": gold,
-                "agent_output": agent_output,
-                "original_result": original,
+                "p_correct_no_evidence": p_baseline,
+                "rounds": rounds_log,
                 "reward_group": reward_group,
-                "smoke_note": "Uses old v2 MCQ for engineering connectivity only; not final training data.",
+                "elapsed_s": round(time.time() - t_row, 2),
             }
             out.write(json.dumps(record, ensure_ascii=False) + "\n")
             out.flush()
             print(json.dumps({
                 "qid": qid,
-                "agent_action": agent_output["action"],
-                "num_rewrites": len(rewrites),
-                "original_hit": original_hit,
+                "p_baseline": round(p_baseline, 4),
+                "num_rounds": len(rounds_log),
                 "best_candidate_id": reward_group.get("best_candidate_id"),
                 "rewards": [round(float(c.get("reward", 0.0)), 4) for c in reward_group.get("candidates", [])],
+                "elapsed_s": round(time.time() - t_row, 2),
             }, ensure_ascii=False))
 
-    print(f"[done] rows={len(rows)} output={out_path}")
+    print(f"[done] rows={len(rows)} output={out_path} elapsed={time.time() - t0:.1f}s")
 
 
 if __name__ == "__main__":

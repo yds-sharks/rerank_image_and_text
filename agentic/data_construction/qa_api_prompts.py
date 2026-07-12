@@ -91,27 +91,25 @@ PDF 相邻两页上下文（fallback/补充证据）：
 }}"""
 
 QA_VERIFICATION_SYSTEM_PROMPT = """你是医学多模态 QA 数据质检员。
-你的任务是严格审核候选四选一问题是否可作为训练数据。你需要根据 query image、题目、选项、候选答案、evidence_basis、图文对描述、图片邻近文本和 PDF 两页上下文判断答案是否可靠。
+你会看到 query image、题目、选项、图文对描述、图片邻近文本和 PDF 两页上下文，但**看不到生成器提出的候选答案**。
 
 必须遵守：
 1. 不要重新创造新题目，不要润色题目，只做审核。
-2. API generator 提出的 candidate_answer 只是候选，不是 gold；你必须独立判断其是否被图像和来源证据支持。
-3. 如果答案不能由图像和来源证据支持，reject。
+2. 你要**独立作答**：结合 query image 与来源证据，从 A/B/C/D 中选出你认为唯一正确的答案 verifier_answer。这是本项目答案治理的核心——gold answer 只有在你的独立作答与生成器候选一致、且证据支持时才成立。
+3. 如果答案不能由图像和来源证据唯一确定，或你无法自信作答，answer_supported 置 false。
 4. 如果题目只靠文本标签可答、图像依赖低，reject。
 5. 如果 organ_tags 多标签导致主答案不唯一，reject。
 6. 如果题面泄露 caption/PDF 证据，reject。
 7. 如果多个选项都可能正确或选项粒度不一致，reject。
 8. 只输出 JSON，不要输出解释性正文。"""
 
-QA_VERIFICATION_USER_TEMPLATE = """请审核下面这道医学多模态四选一候选题是否可以进入训练集。
+QA_VERIFICATION_USER_TEMPLATE = """请对下面这道医学多模态四选一候选题**独立作答并审核**是否可以进入训练集。
+注意：这里不提供候选答案，你必须自己根据 query image 和来源证据判断唯一正确选项。
 
 候选题：
 - query_type: {query_type}
 - question: {question}
 - options: {options}
-- candidate_answer: {answer}
-- candidate_answer_text: {answer_text}
-- evidence_basis: {evidence_basis}
 - rule_low_information_query_seed: {low_information_query_seed}
 
 来源信息：
@@ -136,7 +134,9 @@ PDF 相邻两页上下文（fallback/补充证据）：
 {pdf_context_text}
 
 审核标准：
-- answer_supported: 候选答案是否能被图像和来源证据共同支持。
+- verifier_answer: 你独立选出的唯一正确选项（A/B/C/D）。
+- verifier_confidence: high/medium/low，你对该独立作答的把握。
+- answer_supported: verifier_answer 是否能被图像和来源证据唯一且充分支持。
 - image_dependency: high/medium/low，低图像依赖不能进入训练集。
 - question_naturalness: high/medium/low，题目是否像真实用户面对图像时会问的问题。
 - benchmark_style_match: 是否贴近解剖部位、病变/发现、操作/流程、空间区域这类真实题型。
@@ -145,11 +145,11 @@ PDF 相邻两页上下文（fallback/补充证据）：
 - text_leakage: 题面是否泄露图文对或 PDF 证据。
 - all_options_same_granularity: 四个选项粒度是否一致。
 - multiple_correct_options: 是否存在多个可能正确选项。
-- evidence_basis_valid: generator 给出的 evidence_basis 是否真实支持候选答案。
 
 请严格输出 JSON：
 {{
-  "accept": true/false,
+  "verifier_answer": "A/B/C/D",
+  "verifier_confidence": "high/medium/low",
   "answer_supported": true/false,
   "image_dependency": "high/medium/low",
   "question_naturalness": "high/medium/low",
@@ -159,7 +159,6 @@ PDF 相邻两页上下文（fallback/补充证据）：
   "text_leakage": true/false,
   "all_options_same_granularity": true/false,
   "multiple_correct_options": true/false,
-  "evidence_basis_valid": true/false,
   "reason": "不超过120字"
 }}"""
 
@@ -187,14 +186,17 @@ def render_generation_user_prompt(source: Dict[str, Any], query_type: str) -> st
 
 
 def render_verification_user_prompt(candidate: Dict[str, Any]) -> str:
+    """Render the blind-answer verification prompt.
+
+    Deliberately omits candidate_answer / candidate_answer_text / evidence_basis so
+    the verifier answers independently; the caller compares verifier_answer against
+    the generator's candidate_answer to decide gold.
+    """
     source = candidate.get("source") or candidate
     return QA_VERIFICATION_USER_TEMPLATE.format(
         query_type=candidate.get("query_type") or candidate.get("candidate_query_type", ""),
         question=candidate.get("question", ""),
         options=json.dumps(candidate.get("options", {}), ensure_ascii=False),
-        answer=candidate.get("answer") or candidate.get("candidate_answer", ""),
-        answer_text=candidate.get("answer_text") or candidate.get("candidate_answer_text", ""),
-        evidence_basis=candidate.get("evidence_basis", ""),
         low_information_query_seed=candidate.get("low_information_query_seed") or source.get("low_information_query_seed", ""),
         source_id=source.get("source_id", ""),
         sample_id=source.get("sample_id", ""),

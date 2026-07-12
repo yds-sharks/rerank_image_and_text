@@ -1,22 +1,26 @@
 #!/usr/bin/env python3
-"""Run the frozen RAG stack for Stage-2/3 agentic experiments.
+"""v0.3 agentic RAG runtime pipeline.
 
-Input: Stage-1 QA JSONL or candidate JSONL.
-Output: one JSON row per query with first-stage retrieval, reranked top-k,
-and optional generator response/prediction.
+Flow (no reranker):
+  query + image → retrieve (text top-20 + image top-20, ~40 combined)
+    → agent policy: keep/drop + ACCEPT/REWRITE
+      → ACCEPT: generator answers MCQ with kept evidence
+      → REWRITE: suppress dropped/seen IDs → retrieve again (up to T rounds)
+
+All retrieval / generator frozen; only agent is trainable.
 """
 
 from __future__ import annotations
 
 import argparse
 import json
-import os
+import time
 from pathlib import Path
-from typing import Any, Dict, Iterable, List
+from typing import Any, Dict, Iterable, List, Optional, Set
 
 from generator_adapter import OpenAICompatibleGenerator
+from gpt_agent_adapter import GPTAgent
 from rag_prompting import build_rag_prompt, parse_prediction
-from rerank_adapter import NoOpReranker, PPRReranker
 from retrieval_adapter import FirstStageRetriever, load_config
 
 
@@ -82,19 +86,37 @@ def get_image_path(row: Dict[str, Any]) -> str:
     return ""
 
 
+def apply_keep_drop(evidence: List[Dict[str, Any]], keep: List[int]) -> List[Dict[str, Any]]:
+    """按 agent 的 keep 索引取 kept 证据子集。"""
+    return [evidence[i] for i in keep if 0 <= i < len(evidence)]
+
+
+def collect_evidence_ids(evidence: List[Dict[str, Any]], indices: List[int]) -> Set[str]:
+    """收集指定索引的证据 ID，用于 suppression。"""
+    ids: Set[str] = set()
+    for i in indices:
+        if 0 <= i < len(evidence):
+            item = evidence[i]
+            eid = item.get("sample_id") or item.get("doc_id") or ""
+            if eid:
+                ids.add(str(eid))
+    return ids
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--config", default=str(Path(__file__).resolve().parent / "agentic_runtime_config.json"))
+    parser.add_argument("--api-config", default="/mnt/data_1/yds/多模态/agentic/data_construction/api_config.local.json")
     parser.add_argument("--input-jsonl", required=True)
     parser.add_argument("--output-jsonl", required=True)
     parser.add_argument("--limit", type=int, default=0)
     parser.add_argument("--offset", type=int, default=0)
     parser.add_argument("--query-field", default="low_information_query_seed")
-    parser.add_argument("--text-k", type=int, default=0)
-    parser.add_argument("--image-k", type=int, default=0)
-    parser.add_argument("--topk", type=int, default=5)
+    parser.add_argument("--text-k", type=int, default=20)
+    parser.add_argument("--image-k", type=int, default=20)
+    parser.add_argument("--max-rounds", type=int, default=2, help="Max REWRITE rounds (T).")
+    parser.add_argument("--skip-agent", action="store_true", help="Skip agent; use all evidence as-is.")
     parser.add_argument("--skip-generator", action="store_true")
-    parser.add_argument("--no-ppr-rerank", action="store_true", help="Use first-stage score sorting instead of Qwen3-VL/PPR rerank.")
     parser.add_argument("--continue-on-error", action="store_true")
     return parser.parse_args()
 
@@ -110,11 +132,13 @@ def main() -> None:
     stop = len(rows) if args.limit <= 0 else min(len(rows), start + int(args.limit))
     rows = rows[start:stop]
 
-    reranker = NoOpReranker(select_k=args.topk) if args.no_ppr_rerank else PPRReranker(config)
+    agent = None if args.skip_agent else GPTAgent(api_config_path=args.api_config)
     generator = None if args.skip_generator else OpenAICompatibleGenerator(config)
 
+    t0 = time.time()
     with FirstStageRetriever(config) as retriever, out_path.open("w", encoding="utf-8") as out:
         for idx, row in enumerate(rows, start=start):
+            t_row = time.time()
             qid = get_qid(row, idx)
             query_text = get_query_text(row, args)
             image_path = get_image_path(row)
@@ -122,38 +146,99 @@ def main() -> None:
             options = get_options(row)
             answer = get_answer(row)
             answer_text = get_answer_text(row)
+
             try:
-                retrieval = retriever.retrieve(
-                    query_text,
-                    image_path,
-                    text_k=args.text_k or None,
-                    image_k=args.image_k or None,
-                )
-                reranked = reranker.rerank(query_text, retrieval["combined"], select_k=args.topk)
+                suppressed_ids: Set[str] = set()
+                rounds_log: List[Dict[str, Any]] = []
+                final_evidence: List[Dict[str, Any]] = []
+                final_action = "ACCEPT"
+                final_rewrite_query = ""
+                round_count = 0
+
+                for round_idx in range(args.max_rounds + 1):
+                    round_count = round_idx + 1
+                    retrieval = retriever.retrieve(
+                        query_text, image_path,
+                        text_k=args.text_k or None, image_k=args.image_k or None,
+                        exclude_ids=suppressed_ids,
+                    )
+                    evidence = retrieval["combined"]
+
+                    if agent is not None:
+                        agent_out = agent.decide(
+                            qid=qid,
+                            query_type=str(row.get("query_type") or ""),
+                            original_query=query_text,
+                            question=question,
+                            options=options,
+                            evidence=evidence,
+                            image_path=image_path,
+                        )
+                    else:
+                        # 跳过 agent：keep all, ACCEPT
+                        agent_out = {
+                            "keep": list(range(len(evidence))),
+                            "drop": [],
+                            "action": "ACCEPT",
+                            "rewrite_query": "",
+                            "reason": "skip_agent",
+                        }
+
+                    kept = apply_keep_drop(evidence, agent_out["keep"])
+                    dropped_ids = collect_evidence_ids(evidence, agent_out["drop"])
+                    suppressed_ids |= dropped_ids
+                    # 也抑制已见证据（避免多轮打转）
+                    seen_ids = collect_evidence_ids(evidence, agent_out["keep"])
+                    suppressed_ids |= seen_ids
+
+                    rounds_log.append({
+                        "round": round_idx,
+                        "query": query_text,
+                        "num_evidence": len(evidence),
+                        "keep": agent_out["keep"],
+                        "drop": agent_out["drop"],
+                        "action": agent_out["action"],
+                        "rewrite_query": agent_out.get("rewrite_query", ""),
+                        "reason": agent_out.get("reason", ""),
+                    })
+
+                    if agent_out["action"] == "ACCEPT" or round_idx >= args.max_rounds:
+                        final_evidence = kept
+                        final_action = agent_out["action"]
+                        break
+
+                    # REWRITE → 下一轮用 rewrite_query
+                    query_text = agent_out.get("rewrite_query") or query_text
+                    final_rewrite_query = agent_out.get("rewrite_query", "")
+
+                # Generator
                 response = ""
                 pred = ""
                 correct = None
                 if generator is not None and question and options:
-                    prompt, valid = build_rag_prompt(question, options, reranked)
+                    prompt, valid = build_rag_prompt(question, options, final_evidence)
                     response = generator.generate(prompt, image_path=image_path)
                     pred = parse_prediction(response, valid)
                     correct = (pred == answer) if answer else None
+
                 record = {
                     "qid": qid,
                     "row_index": idx,
-                    "query_text": query_text,
+                    "query_text": get_query_text(row, args),
                     "query_image_path": image_path,
                     "question": question,
                     "options": options,
                     "answer": answer,
                     "answer_text": answer_text,
-                    "retrieval_text": retrieval["text"],
-                    "retrieval_image": retrieval["image"],
-                    "reranked_evidence": reranked,
+                    "final_action": final_action,
+                    "final_evidence": final_evidence,
+                    "final_rewrite_query": final_rewrite_query,
+                    "round_count": round_count,
+                    "rounds": rounds_log,
                     "generator_response": response,
                     "prediction": pred,
                     "correct": correct,
-                    "raw_input": row,
+                    "elapsed_s": round(time.time() - t_row, 2),
                 }
             except Exception as exc:
                 if not args.continue_on_error:
@@ -164,11 +249,17 @@ def main() -> None:
                     "query_text": query_text,
                     "query_image_path": image_path,
                     "error": {"type": type(exc).__name__, "message": str(exc)},
-                    "raw_input": row,
                 }
             out.write(json.dumps(record, ensure_ascii=False) + "\n")
             out.flush()
-    print(f"[done] rows={len(rows)} output={out_path}")
+
+            if (idx - start + 1) % 10 == 0 or (idx - start + 1) == len(rows):
+                elapsed = time.time() - t0
+                rate = (idx - start + 1) / elapsed if elapsed > 0 else 0.0
+                eta = (len(rows) - (idx - start + 1)) / rate if rate > 0 else 0.0
+                print(f"[progress] {idx - start + 1}/{len(rows)} rate={rate:.1f}/s eta={eta:.0f}s")
+
+    print(f"[done] rows={len(rows)} output={out_path} elapsed={time.time() - t0:.1f}s")
 
 
 if __name__ == "__main__":

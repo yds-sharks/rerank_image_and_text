@@ -1,5 +1,11 @@
 #!/usr/bin/env python3
-"""Validate MedAlign-RAG MCQ JSONL files."""
+"""Validate the gold QA JSONL assembled by the Stage-1 pipeline.
+
+Covers: required fields, query_type allowed set, file existence, option schema,
+answer leakage, evidence presence (at least one of caption_or_pair_text /
+image_local_context_text / pdf_context_text), pdf_context_pages length, and
+doc_id split-leakage.
+"""
 
 from __future__ import annotations
 
@@ -10,6 +16,12 @@ from collections import Counter, defaultdict
 from pathlib import Path
 from typing import Any, Dict, Iterable
 
+ALLOWED_QUERY_TYPES = {
+    "anatomical_site_recognition",
+    "lesion_or_finding_identification",
+    "procedure_or_operation_recognition",
+    "spatial_region_understanding",
+}
 
 LEAKAGE_PATTERNS = [
     re.compile(pattern)
@@ -20,6 +32,11 @@ LEAKAGE_PATTERNS = [
         r"选择[A-D]",
         r"\b[A-D]\s*是正确",
     )
+]
+
+REQUIRED_TOP_FIELDS = [
+    "qid", "split", "query_type", "question", "options",
+    "answer", "answer_text", "low_information_query_seed", "query_image_path",
 ]
 
 
@@ -54,60 +71,96 @@ def validate(path: Path) -> Dict[str, Any]:
         answer = row.get("answer")
         options = row.get("options")
         source = row.get("source")
-        provenance = row.get("provenance") or {}
 
         def add(issue: str) -> None:
             issues[issue] += 1
             if len(examples[issue]) < 5:
                 examples[issue].append({"line_no": line_no, "qid": qid})
 
+        # --- top-level required fields ---
+        for field in REQUIRED_TOP_FIELDS:
+            val = row.get(field)
+            if val is None or (isinstance(val, str) and not val.strip()):
+                add(f"missing_{field}")
+
+        # --- qid uniqueness ---
         if not qid:
-            add("missing_qid")
+            pass  # already flagged above
         elif qid in qids:
             add("duplicate_qid")
         qids.add(qid)
 
+        # --- split ---
         if split not in {"train", "dev", "internal_test"}:
             add("invalid_split")
         else:
             split_counts[split] += 1
 
+        # --- query_type ---
         query_type = str(row.get("query_type") or "")
         if not query_type:
-            add("missing_query_type")
+            pass  # already flagged
+        elif query_type not in ALLOWED_QUERY_TYPES:
+            add(f"invalid_query_type:{query_type}")
         else:
             query_type_counts[query_type] += 1
 
-        if not isinstance(options, dict) or set(options) != {"A", "B", "C", "D"}:
-            add("invalid_options")
-        else:
+        # --- options + answer ---
+        if isinstance(options, dict) and set(options) == {"A", "B", "C", "D"}:
             if len(set(str(v) for v in options.values())) != 4:
                 add("duplicate_option_values")
             if answer not in {"A", "B", "C", "D"}:
                 add("invalid_answer")
             elif row.get("answer_text") != options.get(answer):
                 add("answer_text_mismatch")
+        else:
+            add("invalid_options")
 
+        # --- question ---
         question = str(row.get("question") or "")
         if not question:
-            add("missing_question")
+            pass  # already flagged
         if any(pattern.search(question) for pattern in LEAKAGE_PATTERNS):
             add("question_answer_leakage")
+        # answer text should not appear verbatim in the question
+        answer_text = str(row.get("answer_text") or "")
+        if answer_text and len(answer_text) >= 4 and answer_text in question:
+            add("answer_text_in_question")
 
-        if provenance.get("benchmark_used_for_training") is not False:
-            add("benchmark_flag_not_false")
-
+        # --- source ---
         if not isinstance(source, dict):
             add("missing_source")
         else:
             if not source.get("doc_id") and not source.get("doc_name"):
                 add("missing_source_doc")
-            if not source.get("evidence_text"):
-                add("missing_evidence_text")
+            # evidence: at least one of the three text fields must be non-empty
+            has_evidence = any([
+                str(source.get("caption_or_pair_text") or "").strip(),
+                str(source.get("image_local_context_text") or "").strip(),
+                str(source.get("pdf_context_text") or "").strip(),
+            ])
+            if not has_evidence:
+                add("missing_all_evidence_text")
+
             doc_id = str(source.get("doc_id") or "")
             if doc_id and split:
                 doc_splits[doc_id].add(split)
 
+            # pdf_context_pages should be 1-2 pages
+            pdf_pages = source.get("pdf_context_pages")
+            if isinstance(pdf_pages, list) and not (1 <= len(pdf_pages) <= 2):
+                add("pdf_context_pages_out_of_range")
+
+        # --- file existence checks (lightweight: just check Path.exists) ---
+        qip = str(row.get("query_image_path") or "")
+        if qip and not Path(qip).exists():
+            add("missing_query_image_file")
+
+        origin_pdf = (source or {}).get("origin_pdf", "") if isinstance(source, dict) else ""
+        if origin_pdf and not Path(origin_pdf).exists():
+            add("missing_origin_pdf_file")
+
+    # --- doc_id split-leakage ---
     leaked_docs = {doc_id: sorted(splits) for doc_id, splits in doc_splits.items() if len(splits) > 1}
     if leaked_docs:
         issues["doc_id_split_leakage"] = len(leaked_docs)
