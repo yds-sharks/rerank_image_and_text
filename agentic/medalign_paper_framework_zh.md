@@ -1,254 +1,280 @@
-# MedAlign-RAG 设计思路（解耦版）
-
-> 版本 v0.3（2026-07-11 重写）。本文是 agentic 部分的**权威设计思路**，取代旧版
-> framework/workbench spec 中相互矛盾的表述。核心变化：agent 与 reranker 职责解耦，
-> reranker 用现成 reranker 模型（弃 PPR），奖励改为 answer-utility，训练走 SFT 暖启 → GRPO。
-
----
+# MedAlign-RAG 论文框架与训练思路
 
 ## 1. 论文定位
 
-本文的核心贡献不是新的 retriever / reranker / generator，而是：
+本文不把核心贡献定义为新的 retriever 或 reranker，而是定义为：
 
-> 在固定的多模态 RAG 前端之上，训练一个由 **answer-utility 奖励**驱动的
-> **agentic 证据控制器**。它对固定 reranker 给出的少量候选做**逐条跨模态取舍
-> （keep/drop）**，判断证据是否足以作答（**ACCEPT**），不足则**改写 query 重新检索
-> （REWRITE）**，从而提升最终多模态问答效果。
+> 在固定多模态 RAG 检索前端上，训练一个 evidence-selection + query-rewrite agent。系统不部署独立的重排序模型：粗召回后直接按检索分数取 top5 候选（文本+图片）交给 agent。agent 一方面从 top5 中筛选出更有助于回答的证据，另一方面判断证据是否足够，不足时主动改写 query 重新召回，从而提升最终多模态问答效果。
 
-系统中 retriever、密度路由、reranker、generator 全部**冻结**，唯一被训练的组件是这个
-agent。这样避免"堆模块"的审稿风险，也让性能变化能干净地归因到 agent。
+系统中的 retriever、generator 均固定不训练，且不存在独立 reranker 模块。唯一被训练的组件是该 agent。
 
-| 模块 | 作用 | 是否训练 | 角色 |
+这样可以避免论文被理解为简单堆叠多个模块。各模块职责划分如下：
+
+| 模块 | 作用 | 是否训练 | 论文角色 |
 |---|---|---|---|
-| 双路粗召回 | 从文本库/图像库各召回 top-20 | 否 | 固定前端 |
-| 密度感知路由 | 分配文本/图像检索预算、可关噪声模态 | 否 | 固定前端（支撑贡献 C2）|
-| 多模态 reranker | 把 40 候选压到小 top-k（k≈6–8） | 否 | 固定观察压缩器 |
-| **agent** | **keep/drop + ACCEPT/REWRITE + 改写 query** | **是** | **核心贡献 C1** |
-| generator | 基于 kept 证据答 MCQ 并提供 logprob 奖励 | 否 | 冻结评估器 |
+| 粗召回 | 从文本库和图像库召回候选证据，按分数取 top5（文本+图片） | 否 | 固定前端 |
+| evidence-selection + rewrite agent | 从 top5 筛选更有用的证据，并决定 ACCEPT 或改写 query 重新召回 | 是 | 核心贡献 |
+| generator | 基于 agent 选中的证据回答选择题并提供 reward | 否 | 冻结评估器 |
 
----
+## 2. 核心问题
 
-## 2. 核心问题与三痛点
-
-现有多模态 RAG 多为一次性流程 `query → retrieve → rerank → generate`，一旦初始 query
-低密度、图像依赖强，或召回被"同部位不同病理"的相似证据干扰，系统没有自我恢复机制。
-
-- **P1（主）被动一次性相似度选择**：rerank/select 只在已有候选内按相似度排序，
-  (a) 分不清"相关"与"真正有用于答对"（relevance ≠ answer-utility）；
-  (b) 证据池差时无补救（不能改写重检索）。
-- **P2（医学专属）视觉相似 ≠ 临床相同**：内镜图像里同部位不同病理可能视觉高度相似，
-  相似度系统会系统性召回"高置信但临床错误"的证据。需要"判价值"而非"判相似"。
-- **P3（支撑）图文信息密度不一致**：低判别文本会主动制造噪声 → 密度路由，可关掉噪声模态。
-
-本文关注：**当 reranked top-k 不足以支持回答时，agent 能否用 answer-utility 奖励学会
-（i）否决误导证据、（ii）判断是否需要改写、（iii）改写 query 使重检索逼近真正有用的证据。**
-
----
-
-## 3. 方法总览
-
-### 3.1 链路
+现有多模态 RAG 通常采用一次性流程：
 
 ```text
-原始 query（低信息）+ query image
-      │
-      ▼
-密度感知路由（分配文本/图像检索预算）      ← 每轮重检索都重新路由
-      │
-      ▼
-双路粗召回（文本 top-20 + 图像 top-20）
-      │
-      ▼
-固定多模态 reranker → 小 top-k 证据（k≈6–8，图文混合）
-      │
-      ▼
-agent（Qwen3.5-4B 原生多模态，读像素）
-  一次结构化输出：先 keep/drop，再 action
-      │
-      ├─ ACCEPT → generator 基于 kept 证据答 MCQ → answer
-      │
-      └─ REWRITE → 新 query（+ 抑制 dropped/已见 ID）→ 回到路由/召回，最多 T 轮
+query -> retrieve -> rerank -> generate
 ```
 
-### 3.2 agent 的动作空间（一个模型、一次输出）
+一旦初始 query 低密度、图像依赖强，或者召回结果被同部位不同病理的相似证据干扰，系统没有自我恢复机制。单纯的重排序只能在已有候选中调整顺序，无法改变召回分布。
 
-agent 是**单个 VLM policy**，读入：question、options、query image（像素）、当前 top-k 每条证据
-（modality、文本、图片像素或路径、reranker score）。**一次性**吐出一段结构化 JSON，
-决策按 token 顺序排列——**keep/drop 在前**（先看筛完剩什么），**action 在后**：
+本文关注的问题是：
+
+> 当 reranked top5 evidence 不足以支持回答时，模型能否通过 answer-utility reward 学会改写 query，使下一轮召回更接近真正有用的医学证据？
+
+## 3. 主要痛点
+
+### 3.1 一次性检索不可恢复
+
+医学多模态 QA 中，原始 query 常常很短或依赖图像，例如“图中是什么部位”“该病变最符合哪一项”。这类 query 的文本检索信号弱，初始召回容易失败。
+
+传统 RAG 即使加 reranker，也只能在已有候选内重排，不能主动改变检索方向。
+
+### 3.2 相关性不等于答案效用
+
+reranker 的高分证据不一定能帮助 generator 答对。医学图像中，同一部位不同病理可能视觉相似，相关但误导。
+
+因此训练信号不应只来自 relevance，而应来自最终 answer utility。
+
+### 3.3 小模型不应承担大规模 rerank
+
+让小型 agent 直接读取 top20 文本和 top20 图像并完成细粒度排序，成本高且目标混乱。
+
+因此本文不引入独立重排序模型，也不让 agent 在全部 top20 候选上做大规模 rerank。粗召回后直接按检索分数取 top5（文本+图片），agent 只在这 top5 的小观察窗口内做证据筛选，并专注于检索质量诊断与 query rewrite。
+
+## 4. 方法总览
+
+整体链路为：
+
+```text
+原始 query + 可选 query image
+        |
+        v
+固定粗召回 top20（文本库 + 图像库）
+        |
+        v
+按检索分数取 top5（文本 + 图片）
+        |
+        v
+agent：从 top5 筛选有用证据 + 决定 ACCEPT / REWRITE
+        |
+        +-- ACCEPT -> generator 基于选中证据 -> answer
+        |
+        +-- REWRITE -> 新 query -> 重新召回 -> 再取 top5 -> 再筛选 -> generator -> answer
+```
+
+agent 每一步同时输出两部分：证据筛选结果和动作决策。
 
 ```json
-{"keep": [1,3,4], "drop": [2,5], "action": "ACCEPT"}
+{"selected_evidence": ["E1", "E3"], "action": "ACCEPT"}
 ```
 
 ```json
-{"keep": [1], "drop": [2,3,4,5], "action": "REWRITE", "rewrite_query": "..."}
+{"selected_evidence": ["E2"], "action": "REWRITE", "rewrite_query": "..."}
 ```
 
-- **不是两个模型、不是两次调用**，就是一个 policy 自回归生成这一段；动作 = 解析 JSON。
-- keep/drop 是**小范围逐条否决**（对 reranker 给的 k 条，不是对 40 条重排）→ 动作空间有界、
-  方差可控，且**不等于再训一个大 reranker**。
-- **P2 落点**：keep/drop 让 agent 能显式 drop 掉"视觉相似但临床错"的证据；REWRITE 通过注入
-  判别性临床词 + 抑制已见 ID，把临床正确的证据从相似陷阱里"拉上来"。
+其中 `selected_evidence` 是 agent 从当前 top5 中挑选出的、更有助于回答的证据子集；`action` 决定是用选中证据直接作答（ACCEPT），还是改写 query 重新召回（REWRITE）。
 
-### 3.3 抑制（suppression）
+## 5. 训练数据构造
 
-REWRITE 时把 dropped / 前几轮已见的证据 ID 在**召回层**排除（不是 rerank 层），使多轮检索
-**单调探索新证据**、避免在同一批垃圾上打转。注意：只在召回层抑制，避免把"被 reranker 排错、
-其实正确"的证据永久删掉。
+训练数据不使用 benchmark 样本。Benchmark 仅用于统计问题类型分布和最终测试。
 
----
+训练样本来自：
 
-## 4. 奖励设计（answer-utility，护城河）
+- 自有向量库中的 image-text pair；
+- 原始 PDF；
+- PDF 图片、图注和邻近正文；
+- 已有元数据中的器官/部位、病理/类型标签。
 
-唯一主奖励来自**冻结 generator 的答案效用**，不来自检索相关性命中：
+每条训练样本必须是四选一选择题：
+
+- `question`
+- `options: A/B/C/D`
+- `answer`
+- `answer_text`
+- `query_image_path`
+- 简单 source provenance
+
+API 模型只负责生成或润色 `question` 和 `options`，不得从零判断 gold answer。正确答案必须由源数据元信息或确定性构造逻辑决定。
+
+## 6. 训练框架
+
+### 6.1 训练目标
+
+训练目标不是让 agent 成为 reranker，而是让它学习：
+
+1. 当前 top5 evidence 是否足够；
+2. 如果不足，应该如何改写 query；
+3. 改写后的 query 是否能通过重新召回带来更高 answer utility。
+
+### 6.2 固定前端
+
+训练过程中以下模块全部冻结：
+
+- retriever；
+- organ/site filter，如保留；
+- modality routing，如保留；
+- generator。
+
+系统不含可训练或独立的重排序模块；top5 由粗召回分数直接确定。这样可以将性能变化归因于 agent 的证据筛选与 query rewrite。
+
+### 6.3 GPT Agent 预验证
+
+在训练小模型之前，先使用 GPT 作为 rewrite agent 验证该任务是否有可学习收益。
+
+对于同一条样本，比较两条路径：
 
 ```text
-对某个动作 a（其产出的证据集为 E_a）：
-    r(a) = P_G(a* | q, I_q, E_a) − P_G(a* | q, I_q, ∅)
+原始 query -> recall -> rerank top5 -> generator -> reward_original
 ```
-
-- `a*` 为正确选项 token，`P_G` 为冻结 generator 给正确选项的概率（从 vLLM logprobs 取）。
-- ACCEPT 的 `E_a` = kept 子集；REWRITE 的 `E_a` = 重检索+重排+再 keep 后的证据集。
-- baseline `P_G(...|∅)` = 不给证据时的概率。
-
-> ⚠️ 这是整个方法的护城河。一旦奖励退回"检索命中/相关性"，方法就塌成"学一个检索 query
-> 改写器"，与 Search-R1 / IterRetGen / DeepRAG 撞车且丢失医学特异性。**generator 必须能出
-> logprob，否则奖励与下文软标签都算不出来。**
-
-轻量约束项（工程约束，论文里不作为主贡献）：无效 JSON、泄露答案字母、改写过长、不必要改写
-（原证据已够仍 REWRITE）各扣少量分。
-
----
-
-## 5. 训练框架
-
-### 5.1 GPT Agent 预验证（Go/No-Go 闸门）
-
-训练小模型前，先用 GPT 当 agent 跑同一批样本，比较：
 
 ```text
-原始 query → 召回/rerank/kept → generator → reward_original
-GPT 决策（keep/drop + ACCEPT/REWRITE）→ ... → reward_gpt
+GPT rewrite query -> recall -> rerank top5 -> generator -> reward_rewrite
 ```
 
-若 GPT 不能稳定优于 no-op，则先查数据/召回/reranker/generator，不急于训小模型。
+如果 GPT rewrite 不能稳定优于 no-rewrite，则不应直接训练小模型，应优先检查数据、召回、reranker 和 generator/reward。
 
-### 5.2 两阶段训练（SFT 暖启 → GRPO）
+### 6.4 GRPO 训练
 
-**阶段一：cold-start SFT 暖启（保持轻）**
-目标只是让模型出合法 JSON + 粗略正确的先验，**不喂太饱**（喂饱=RL 没空间=稀释主线）。
-监督目标为完整 JSON（keep/drop + action 一起）：
-- keep/drop 标签 = 见 §6 软标签（冻结 generator 自动生成，无需人工）。
-- ACCEPT/REWRITE 及 rewrite 文本标签 = 来自 GPT rollout（§5.1）里 utility 真升的决策。
+小模型训练采用 GRPO。每个 query 形成一个 group，包含多个 agent 输出（证据筛选 + 动作组合）：
 
-**阶段二：GRPO（主线、增益来源）**
-每个 query 一个 group，组内包含多个动作各自跑完整闭环：
+- 不同证据筛选下的 `ACCEPT`
+- 多个不同 `REWRITE` 候选
+
+每个候选动作都实际执行完整链路：
 
 ```text
-{ ACCEPT(原始 top-k),  keep-子集,  rewrite 分支×N }
- 每个动作 → (REWRITE 则重检索) → rerank → kept → generator → r(a)
+action
+ -> 如果 REWRITE，则用新 query 重新召回并按分数取 top5
+ -> generator 基于选中证据回答
+ -> 计算 reward
 ```
 
-GRPO 用组内相对优势 `A = (r − mean)/std` 推动 policy 偏向高 answer-utility 的动作。
+GRPO 在组内比较不同动作的 reward，推动模型更倾向于产生高 answer-utility 的动作。
 
-### 5.3 为什么 SFT 不够、也不违背 agentic RL
+### 6.5 Reward 设计
 
-- **SFT 不够**：软标签是代理信号（天花板受限）；SFT 只能模仿 GPT 的改写、发现不了更优改写；
-  无组内反事实比较；多轮时单步模仿会累积漂移。**RL 才是真正优化 answer-utility 的地方。**
-- **不违背主线**：SFT→RL 是标准做法（RLHF 的 SFT→PPO、DeepSeek-R1 的 cold-start SFT→RL）。
-  headline 仍是"policy 由 answer-utility RL 优化"，SFT 写成 cold-start/rejection-sampling 暖启。
-- **硬要求**：必须做 **SFT-only vs SFT+RL 消融**，用数字证明 RL 挣到了它的位置（也是卖点）。
+主 reward：
 
----
+```text
+R = U(rewrite_query) - U(original_query)
+```
 
-## 6. keep/drop 软标签构造（自动、无需人标）
+其中 `U` 表示 frozen generator 在给定 top5 evidence 后的 answer utility。
 
-用冻结 generator 当"探针"，看每条证据把正确答案概率抬高还是压低：
+可用的 answer utility 包括：
 
-1. **测基线**：只给"题目+题图+选项"（无检索证据），记正确选项概率，例 0.30。
-2. **逐条测增量**：把 top-k 每条证据 e_i 单独加入再问一次，记新概率：
-   - +第3条 → 0.55（增量 +0.25）→ keep
-   - +第2条 → 0.20（增量 −0.10）→ drop
-3. 对 k 条各做一遍 → 得逐条 keep/drop 标签，作为阶段一 SFT 目标。
+- 是否答对四选一选择题；
+- 正确选项 log probability；
+- 相对 empty evidence 的 correct option logprob lift。
 
-概率来源：让 generator 只输出单字母答案，从 vLLM logprobs 取该字母 token 的 logprob 转概率。
-廉价版"逐条单加"忽略交互但够暖启用；更准的 leave-one-out 更贵，非必需。
+训练时可以加入轻量约束项：
 
----
+- 无效 JSON 扣分；
+- 泄露答案字母扣分；
+- 明显偏离原问题扣分；
+- 过长或无意义 rewrite 扣分。
 
-## 7. 模型选型
+论文主叙事中应强调 answer-utility reward，避免把工程约束项写成主要贡献。
 
-| 组件 | 选型 | 说明 |
-|---|---|---|
-| policy（训练） | **Qwen3.5-4B（原生多模态，看像素）** | 任务规模够用；看图才能撑 P2 的视觉否决 |
-| generator（冻结） | Qwen3-VL-8B-Instruct（vLLM，需开 logprobs） | 算 answer-utility 与软标签 |
-| reranker（冻结） | 现成 reranker 模型（**弃 PPR**） | 40→小 top-k；见下 |
-| 文本召回 | BGE-M3（1024d，~517K 段，top-20） | 冻结 |
-| 图像召回 | Qwen3-VL 图像塔（4096d，~66K 图，top-20） | 冻结 |
-| 密度路由 | Mengzi-BERT 双头（密度 L0–L4 + 图像依赖 R1–R3） | 冻结，checkpoint 就绪 |
+### 6.6 Agent 输入
 
-> **reranker 待定项**：候选池含文本+图像，需要能对图文联合打分的多模态 reranker，
-> 或明确"reranker = 一阶分数排序（NoOp）"并如实写。**不要用 embedding 双塔冒充 reranker。**
-> 这是当前最欠定义的一块，实现前需拍板。
+agent 输入包括：
 
----
+- question；
+- options；
+- query image 是否存在；
+- 当前按检索分数取出的 top5 evidence；
+- 每条 evidence 的 modality、文本、图片路径或图片摘要、粗召回检索分数。
 
-## 8. 数据构造（详见 data_construction_design_zh.md）
+agent 不接收 top20/top20 原始候选，只在 top5 观察窗口内做筛选与决策。
 
-- 训练数据**不使用 benchmark 样本**；benchmark 仅用于统计分布与最终测试。
-- 来源：自有向量库 image-text pair + 原始 PDF + 图注/邻近正文 + 器官/病理元信息。
-- 每条为四选一 MCQ：question / options / answer / answer_text / query_image_path / source。
-- **正确答案由来源元信息 + 独立 verifier 决定，不由 API 单独判定。**
-- 生成与校验的 API 调用**必须传入图像像素**（否则"图像依赖"与 verifier 独立性失效）。
-- pipeline：`prepare_qa_source_pool → route_qa_source_pool → generate（API，带图）→
-  verify（API，带图）→ validate`。按 doc_id 切分防泄漏；lesion 类优先"同部位不同病理"hard neg；
-  禁止 taxonomy 元分类题。
+### 6.7 Agent 输出
 
----
+agent 输出必须为 JSON，同时包含证据筛选与动作：
 
-## 9. 实验设计
+```json
+{"selected_evidence": ["E1", "E3"], "action": "ACCEPT"}
+```
 
-### 9.1 主表
+或：
 
-| Method | keep/drop | Rewrite | Trainable | Overall |
+```json
+{"selected_evidence": ["E2"], "action": "REWRITE", "rewrite_query": "..."}
+```
+
+推理时不给 gold answer。
+
+训练数据构造阶段可以使用 gold answer 辅助生成候选题目，但不能让最终 agent prompt 依赖 gold answer。
+
+## 7. 实验设计
+
+### 7.1 主实验
+
+主表比较：
+
+| Method | Selection | Rewrite | Trainable | Overall |
 |---|---|---|---|---|
-| Closed-book generator | — | No | No | TBD |
-| Retrieve + rerank top-k | No | No | No | TBD |
-| + agent（no rewrite，仅 keep/drop） | Yes | No | Yes | TBD |
-| Agentic baselines（Self-RAG / Search-R1 / IterRetGen 适配） | — | Yes | Yes | TBD |
-| **MedAlign-RAG（full RL）** | Yes | Yes | Yes | TBD |
+| Closed-book generator | No | No | No | TBD |
+| Retrieve top5（全部证据直接作答） | No | No | No | TBD |
+| GPT selection + rewrite | Yes | Yes | No | TBD |
+| GRPO agent（selection + rewrite） | Yes | Yes | Yes | TBD |
 
-### 9.2 消融
+重点证明：在相同固定前端下，训练后的 agent（证据筛选 + query rewrite）优于 no-rewrite 和非训练基线。
 
-- keep/drop on/off；
-- rewrite + re-retrieve on/off；
-- 抑制 suppression on/off；
-- 奖励：answer-utility vs relevance/format（证明护城河）；
-- **SFT-only vs SFT+RL（证明 RL 增益）**；
-- 最大轮数 T（1 vs 2）；
-- 密度路由 on/off。
+### 7.2 消融实验
 
-### 9.3 分析指标
+推荐消融：
 
-最终 accuracy 外：rewrite trigger rate、keep/drop 准确率（对照 §6 离线 utility 标签）、
-证据 utility lift、平均轮数、模态分布、invalid JSON rate、answer leakage rate、
-kept 证据中有效证据比例变化。
+- w/o evidence selection：agent 只改写 query，不筛选证据（top5 全部给 generator）；
+- w/o rewrite：agent 只筛选证据，不允许改写 query；
+- w/o answer-utility reward：替换为格式或相关性 reward；
+- one rewrite round vs two rewrite rounds；
+- GPT agent vs trained small agent。
 
----
+### 7.3 分析指标
 
-## 10. 叙事边界
+除最终 accuracy 外，建议报告：
 
-**不主打**：新 retriever / reranker / generator / 器官识别 / 图文权重模块。
-**主打**：固定多模态 RAG 前端上、由 answer-utility RL 训练的 agentic 跨模态证据控制器
-（keep/drop + accept/rewrite）。这一定位降低"堆模块"风险，也让消融清晰。
+- rewrite trigger rate；
+- rewrite success rate；
+- original-query reward vs rewrite-query reward；
+- invalid JSON rate；
+- answer leakage rate；
+- average inference rounds；
+- top5 evidence 中有效证据比例变化。
 
----
+## 8. 贡献写法
 
-## 11. 与代码现状的差距（实现待办）
+建议贡献点写成：
 
-- `code/reward_model.py`：当前是 evidence-hit（相关性命中），**需改为 §4 的 answer-utility**。
-- `code/generator_adapter.py`：当前只回文本，**需支持取 logprob**（vLLM logprobs）。
-- `code/rerank_adapter.py`：当前只有 PPR/NoOp，**需替换为现成 reranker 模型**（§7 待拍板）。
-- 密度路由未接入 runtime（retrieval_adapter 有 level1/level2 钩子但未传）——**需接线**。
-- 数据侧缺 `generate_qa_candidates_with_api.py`（生成 caller，须带图），verify 须对齐新流字段
-  并默认带图、复用 `qa_api_prompts.py`。
+1. 提出一种 answer-utility guided agent，在固定多模态 RAG 前端中同时完成证据筛选与 query rewrite，用于检索失败恢复。
+2. 构建不使用 benchmark 训练样本的 source-grounded 医学多模态选择题构造流程。
+3. 通过 GRPO 直接优化 agent policy，使其学会在 top5 观察窗口内筛选证据，并在 ACCEPT 与 REWRITE 之间做决策。
+4. 在固定 retriever、generator 且无独立 reranker 的设置下验证 agent 的增益，避免将收益归因于前端模块变化。
+
+## 9. 论文叙事边界
+
+本文不主打：
+
+- 新 retriever；
+- 新 reranker（本文不含独立 reranker 模块）；
+- 新 generator；
+- 器官识别模块；
+- 图文权重模块。
+
+这些可以作为固定前端或工程组件保留，但不应进入核心贡献。
+
+本文主打：
+
+> 固定多模态 RAG 检索栈上的可学习 evidence-selection + query-rewrite controller。
+
+这一定位能降低“堆模块”的审稿风险，也使消融更加清晰。

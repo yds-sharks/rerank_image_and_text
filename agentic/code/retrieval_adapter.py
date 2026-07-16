@@ -5,9 +5,6 @@ This module wraps the existing multimodal Milvus search engine without copying
 its model/index logic. It exposes one stable call:
 
     retrieve(query_text, query_image_path) -> {text, image, combined}
-
-v0.3 新增：exclude_ids 参数，用于在**召回层**抑制已见/dropped 的证据 ID，
-使多轮检索单调探索新证据。
 """
 
 from __future__ import annotations
@@ -16,7 +13,7 @@ import importlib.util
 import json
 import sys
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Set
+from typing import Any, Dict, List, Optional
 
 CODE_DIR = Path(__file__).resolve().parent
 DEFAULT_CONFIG = CODE_DIR / "agentic_runtime_config.json"
@@ -93,51 +90,31 @@ class FirstStageRetriever:
             "raw": hit,
         }
 
-    @staticmethod
-    def _get_hit_id(hit: Dict[str, Any]) -> str:
-        """提取证据 ID 用于 suppression 比较。"""
-        return str(hit.get("sample_id") or hit.get("doc_id") or "")
-
-    def _filter_excluded(self, hits: List[Dict[str, Any]], exclude_ids: Optional[Set[str]]) -> List[Dict[str, Any]]:
-        """在召回层过滤掉已被抑制的证据 ID。"""
-        if not exclude_ids:
-            return hits
-        return [h for h in hits if self._get_hit_id(h) not in exclude_ids]
-
-    def search_text(self, query_text: str, *, k: Optional[int] = None, level1: str = "", level2: str = "", exclude_ids: Optional[Set[str]] = None) -> List[Dict[str, Any]]:
+    def search_text(self, query_text: str, *, k: Optional[int] = None, level1: str = "", level2: str = "") -> List[Dict[str, Any]]:
         if not query_text or not str(query_text).strip():
             return []
-        # 多取一些，过滤掉 exclude 后仍可能有足够数量
-        fetch_k = int(k or self.text_k)
-        if exclude_ids:
-            fetch_k += len(exclude_ids)
         req = self._module.RetrievalRequest(
             q=str(query_text).strip(),
-            k=fetch_k,
+            k=int(k or self.text_k),
             level1=level1,
             level2=level2,
             retrieval_db="text",
         )
         out = self.engine.search(req)
-        hits = [self._normalize_hit(hit, "text") for hit in out.get("results", [])]
-        return self._filter_excluded(hits, exclude_ids)[:int(k or self.text_k)]
+        return [self._normalize_hit(hit, "text") for hit in out.get("results", [])]
 
-    def search_image(self, image_path: str, *, k: Optional[int] = None, level1: str = "", level2: str = "", exclude_ids: Optional[Set[str]] = None) -> List[Dict[str, Any]]:
+    def search_image(self, image_path: str, *, k: Optional[int] = None, level1: str = "", level2: str = "") -> List[Dict[str, Any]]:
         if not image_path or not Path(image_path).exists():
             return []
-        fetch_k = int(k or self.image_k)
-        if exclude_ids:
-            fetch_k += len(exclude_ids)
         req = self._module.RetrievalRequest(
             q=str(image_path),
-            k=fetch_k,
+            k=int(k or self.image_k),
             level1=level1,
             level2=level2,
             retrieval_db="image",
         )
         out = self.engine.search(req)
-        hits = [self._normalize_hit(hit, "image") for hit in out.get("results", [])]
-        return self._filter_excluded(hits, exclude_ids)[:int(k or self.image_k)]
+        return [self._normalize_hit(hit, "image") for hit in out.get("results", [])]
 
     def retrieve(
         self,
@@ -148,13 +125,12 @@ class FirstStageRetriever:
         image_k: Optional[int] = None,
         level1: str = "",
         level2: str = "",
-        exclude_ids: Optional[Set[str]] = None,
     ) -> Dict[str, List[Dict[str, Any]]]:
         text_hits = []
         image_hits = []
         if text_k is None or int(text_k) > 0:
-            text_hits = self.search_text(query_text, k=text_k, level1=level1, level2=level2, exclude_ids=exclude_ids)
+            text_hits = self.search_text(query_text, k=text_k, level1=level1, level2=level2)
         if query_image_path and (image_k is None or int(image_k) > 0):
-            image_hits = self.search_image(query_image_path, k=image_k, level1=level1, level2=level2, exclude_ids=exclude_ids)
+            image_hits = self.search_image(query_image_path, k=image_k, level1=level1, level2=level2)
         combined = text_hits + image_hits
         return {"text": text_hits, "image": image_hits, "combined": combined}

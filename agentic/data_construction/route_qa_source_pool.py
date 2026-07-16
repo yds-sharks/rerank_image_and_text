@@ -5,19 +5,11 @@ from __future__ import annotations
 
 import argparse
 import json
-import time
 from collections import Counter, defaultdict
 from pathlib import Path
-from typing import Any, Dict, List, Tuple
+from typing import Any, Dict, Iterable, List, Tuple
 
-from qa_stage1_common import (
-    candidate_id,
-    clean_text,
-    iter_jsonl,
-    non_generic_organs,
-    write_json_atomic,
-    write_jsonl_atomic,
-)
+from qa_stage1_common import candidate_id, clean_text, iter_jsonl, non_generic_organs
 
 DEFAULT_INPUT = "/mnt/data_1/yds/多模态/agentic/outputs/qa_stage1_prepared/source_pool.jsonl"
 DEFAULT_OUTPUT_DIR = "/mnt/data_1/yds/多模态/agentic/outputs/qa_stage1_prepared"
@@ -143,7 +135,6 @@ def main() -> None:
     out_dir = Path(args.output_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    t0 = time.time()
     source_rows: List[Dict[str, Any]] = []
     candidate_rows: List[Dict[str, Any]] = []
     no_route = 0
@@ -168,10 +159,14 @@ def main() -> None:
             candidate_rows.append(cand)
 
     routed_path = out_dir / "routed_source_pool.jsonl"
-    write_jsonl_atomic(routed_path, source_rows)
+    with routed_path.open("w", encoding="utf-8") as handle:
+        for row in source_rows:
+            handle.write(json.dumps(row, ensure_ascii=False) + "\n")
 
     candidate_path = out_dir / "routed_qa_candidates.jsonl"
-    write_jsonl_atomic(candidate_path, candidate_rows)
+    with candidate_path.open("w", encoding="utf-8") as handle:
+        for row in candidate_rows:
+            handle.write(json.dumps(row, ensure_ascii=False) + "\n")
 
     pilot_rows: List[Dict[str, Any]] = []
     per_type_counts: Counter = Counter()
@@ -190,7 +185,9 @@ def main() -> None:
             break
 
     pilot_path = out_dir / "pilot_qa_candidates.jsonl"
-    write_jsonl_atomic(pilot_path, pilot_rows)
+    with pilot_path.open("w", encoding="utf-8") as handle:
+        for row in pilot_rows:
+            handle.write(json.dumps(row, ensure_ascii=False) + "\n")
 
     report = {
         "input": args.input,
@@ -200,12 +197,12 @@ def main() -> None:
         "source_count": len(source_rows),
         "candidate_count": len(candidate_rows),
         "no_route_count": no_route,
-        "elapsed_s": round(time.time() - t0, 1),
         "candidate_query_type_counts": dict(Counter(row["candidate_query_type"] for row in candidate_rows)),
         "pilot_query_type_counts": dict(per_type_counts),
         "split_counts": dict(Counter(row["split"] for row in source_rows)),
     }
-    write_json_atomic(out_dir / "routing_report.json", report)
+    report_path = out_dir / "routing_report.json"
+    report_path.write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
     print(json.dumps(report, ensure_ascii=False, indent=2))
 
 

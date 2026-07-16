@@ -5,69 +5,14 @@ from __future__ import annotations
 
 import hashlib
 import json
-import os
-import tempfile
+import re
 from functools import lru_cache
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
-import re
 
 
 def stable_hash(text: str) -> str:
     return hashlib.sha1(text.encode("utf-8")).hexdigest()
-
-
-def row_get(row: Any, key: str, default: Any = None) -> Any:
-    """Safe getter for sqlite3.Row / dict that tolerates missing columns."""
-    try:
-        keys = row.keys()
-    except AttributeError:
-        keys = row
-    if key in keys:
-        value = row[key]
-        return default if value is None else value
-    return default
-
-
-def write_jsonl_atomic(path: Path, rows: Iterable[Dict[str, Any]]) -> int:
-    """Write rows to a temp file in the same dir, then os.replace for atomicity.
-
-    Prevents downstream steps from ever reading a half-written file if this
-    process is interrupted mid-write.
-    """
-    path = Path(path)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    count = 0
-    fd, tmp_name = tempfile.mkstemp(dir=str(path.parent), prefix=path.name + ".", suffix=".tmp")
-    try:
-        with os.fdopen(fd, "w", encoding="utf-8") as handle:
-            for row in rows:
-                handle.write(json.dumps(row, ensure_ascii=False) + "\n")
-                count += 1
-            handle.flush()
-            os.fsync(handle.fileno())
-        os.replace(tmp_name, path)
-    except BaseException:
-        if os.path.exists(tmp_name):
-            os.unlink(tmp_name)
-        raise
-    return count
-
-
-def write_json_atomic(path: Path, obj: Any) -> None:
-    path = Path(path)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    fd, tmp_name = tempfile.mkstemp(dir=str(path.parent), prefix=path.name + ".", suffix=".tmp")
-    try:
-        with os.fdopen(fd, "w", encoding="utf-8") as handle:
-            handle.write(json.dumps(obj, ensure_ascii=False, indent=2) + "\n")
-            handle.flush()
-            os.fsync(handle.fileno())
-        os.replace(tmp_name, path)
-    except BaseException:
-        if os.path.exists(tmp_name):
-            os.unlink(tmp_name)
-        raise
 
 
 def doc_split(doc_id: str, seed: int = 20260709) -> str:

@@ -1,13 +1,5 @@
 #!/usr/bin/env python3
-"""v0.3 agent policy adapter (GPT rollout / inference).
-
-单 policy 一次输出 keep/drop + ACCEPT/REWRITE(+rewrite_query)。
-没有中间 reranker：检索结果直接喂给 policy，policy 直接看像素做逐条价值判断。
-
-输出 schema（与设计文档 §3.2 对齐）：
-  {"keep": [0, 2, 4], "drop": [1, 3], "action": "ACCEPT"}
-  {"keep": [0], "drop": [1,2,3,4], "action": "REWRITE", "rewrite_query": "..."}
-"""
+"""GPT rewrite-agent adapter for Stage-2 rollout smoke tests."""
 
 from __future__ import annotations
 
@@ -22,29 +14,22 @@ from rag_prompting import format_evidence
 
 DEFAULT_API_CONFIG = "/mnt/data_1/yds/多模态/agentic/data_construction/api_config.local.json"
 
-SYSTEM_PROMPT = """你是医学多模态 RAG 的 agentic 证据控制器。
+SYSTEM_PROMPT = """你是医学多模态 RAG 的 query rewrite 控制器。
+给定问题、选项、原始低信息 query、query image 和当前 top-k 证据，判断当前证据是否足以支持回答。
 
-给定问题、选项、原始低信息 query、query image 和当前检索证据（每条带 modality/文本/图片路径/score），
-你需要做两件事，**在一次 JSON 输出里完成**：
-
-1. **keep/drop 逐条价值判断**：对每条检索证据，判断它对回答当前问题是有价值（keep）还是误导/无用（drop）。
-   关键：医学图像里"视觉相似 ≠ 临床相同"，同部位不同病理经常高度相似。你要能 drop 掉那些"看起来像、
-   但临床逻辑/证据文本指向另一个诊断"的高置信误导证据。
-
-2. **ACCEPT/REWRITE 决策**：
-   - 如果 kept 证据已经足够唯一确定正确答案 → action="ACCEPT"，不需要改写。
-   - 如果 kept 证据不足、歧义、或明显缺少关键判别信息 → action="REWRITE"，并给出更精准的
-     rewrite_query 用于下一轮重检索。
+你只能输出 JSON。
+如果证据足够，输出 action=ACCEPT，rewrite_candidates=[]。
+如果证据不足或偏题，输出 action=REWRITE，并给出 2-4 条更适合检索的 rewrite_candidates。
 
 约束：
-- rewrite_query 不能包含答案字母（A/B/C/D）。
-- rewrite_query 不能直接说"正确答案是..."或泄露 gold answer。
-- rewrite_query 应注入判别性临床词、视觉特征、部位或选项区分信息。
-- 不要生成最终答案，只做证据取舍和检索策略决策。
-- 只输出 JSON，不输出解释性正文。
+- rewrite query 不能包含答案字母。
+- rewrite query 不能直接说“正确答案是...”。
+- rewrite query 可以包含题目中的选项内容，因为真实检索时可利用选项区分意图。
+- rewrite query 应强调关键视觉特征、部位、病变/操作类型或选项区分信息。
+- 不要生成最终答案，只做 ACCEPT/REWRITE 决策。
 """
 
-USER_TEMPLATE = """请基于 query image 和当前检索证据，做 keep/drop + ACCEPT/REWRITE 决策。
+USER_TEMPLATE = """请判断是否需要改写检索 query。
 
 qid: {qid}
 query_type: {query_type}
@@ -52,19 +37,16 @@ query_type: {query_type}
 问题: {question}
 选项: {options}
 
-当前检索证据（{num_evidence} 条，按检索顺序编号）：
+当前 top-k 证据：
 {evidence_block}
 
 请严格输出 JSON：
 {{
-  "keep": [idx_1, idx_2, ...],
-  "drop": [idx_1, idx_2, ...],
   "action": "ACCEPT" 或 "REWRITE",
-  "rewrite_query": "仅当 action=REWRITE 时填写，否则空字符串",
-  "reason": "不超过 100 字，说明 kept 证据是否足够作答，或为什么需要改写"
+  "rewrite_candidates": ["...", "..."],
+  "failure_type": "none/missing_anatomical_site/missing_lesion_or_finding/missing_procedure_or_operation/missing_spatial_region/off_topic/ambiguous_evidence",
+  "reason": "不超过80字"
 }}
-
-注意：keep 与 drop 索引必须覆盖全部 {num_evidence} 条证据，且不能重叠。
 """
 
 
@@ -73,36 +55,7 @@ def load_api_config(path: str = DEFAULT_API_CONFIG) -> Dict[str, Any]:
     return data
 
 
-def _parse_keep_drop(data: Dict[str, Any], num_evidence: int) -> Dict[str, Any]:
-    """校验并规整 keep/drop 字段。"""
-    keep = data.get("keep") or []
-    drop = data.get("drop") or []
-    if not isinstance(keep, list):
-        keep = []
-    if not isinstance(drop, list):
-        drop = []
-    keep = [int(x) for x in keep if str(x).isdigit()]
-    drop = [int(x) for x in drop if str(x).isdigit()]
-    keep = sorted(set(i for i in keep if 0 <= i < num_evidence))
-    drop = sorted(set(i for i in drop if 0 <= i < num_evidence))
-    keep_set = set(keep)
-    drop_set = set(drop)
-    # 重叠索引归到 keep
-    overlap = keep_set & drop_set
-    if overlap:
-        drop = [i for i in drop if i not in overlap]
-        drop_set = set(drop)
-    # 未出现的索引默认归到 drop
-    for i in range(num_evidence):
-        if i not in keep_set and i not in drop_set:
-            drop.append(i)
-    drop = sorted(set(drop))
-    return {"keep": keep, "drop": drop}
-
-
-class GPTAgent:
-    """v0.3 GPT agent：一次输出 keep/drop + ACCEPT/REWRITE。"""
-
+class GPTRewriteAgent:
     def __init__(
         self,
         *,
@@ -120,11 +73,11 @@ class GPTAgent:
         self.timeout = int(timeout or cfg.get("timeout", 120))
         self.max_tokens = int(max_tokens)
         if not self.api_key:
-            raise ValueError("Missing API key for GPTAgent")
+            raise ValueError("Missing API key for GPTRewriteAgent")
         if not self.base_url:
-            raise ValueError("Missing base_url for GPTAgent")
+            raise ValueError("Missing base_url for GPTRewriteAgent")
         if not self.model:
-            raise ValueError("Missing model for GPTAgent")
+            raise ValueError("Missing model for GPTRewriteAgent")
         self.session = requests.Session()
         self.session.trust_env = False
 
@@ -143,6 +96,7 @@ class GPTAgent:
             try:
                 resp = self.session.post(url, headers=headers, json=payload, timeout=self.timeout)
                 if resp.status_code in {400, 404, 405} and "response_format" in payload:
+                    # Some OpenAI-compatible gateways do not accept response_format.
                     payload2 = dict(payload)
                     payload2.pop("response_format", None)
                     resp = self.session.post(url, headers=headers, json=payload2, timeout=self.timeout)
@@ -174,14 +128,12 @@ class GPTAgent:
         evidence: List[Dict[str, Any]],
         image_path: str = "",
     ) -> Dict[str, Any]:
-        num_evidence = len(evidence)
         user_text = USER_TEMPLATE.format(
             qid=qid,
             query_type=query_type,
             original_query=original_query,
             question=question,
             options=json.dumps(options, ensure_ascii=False),
-            num_evidence=num_evidence,
             evidence_block=format_evidence(evidence, max_chars_per_doc=700),
         )
         content: List[Dict[str, Any]] = [{"type": "text", "text": user_text}]
@@ -192,23 +144,19 @@ class GPTAgent:
             {"role": "system", "content": SYSTEM_PROMPT},
             {"role": "user", "content": content},
         ])
-
-        kd = _parse_keep_drop(data, num_evidence)
         action = str(data.get("action") or "").upper()
         if action not in {"ACCEPT", "REWRITE"}:
             action = "REWRITE"
-        rewrite_query = str(data.get("rewrite_query") or "").strip()
+        rewrites = data.get("rewrite_candidates") or []
+        if isinstance(rewrites, str):
+            rewrites = [rewrites]
+        rewrites = [str(x).strip() for x in rewrites if str(x).strip()]
         if action == "ACCEPT":
-            rewrite_query = ""
+            rewrites = []
         return {
-            "keep": kd["keep"],
-            "drop": kd["drop"],
             "action": action,
-            "rewrite_query": rewrite_query,
+            "rewrite_candidates": rewrites[:4],
+            "failure_type": str(data.get("failure_type") or "none"),
             "reason": str(data.get("reason") or ""),
             "raw": data,
         }
-
-
-# 兼容旧名（smoke 脚本引用）
-GPTRewriteAgent = GPTAgent

@@ -11,13 +11,13 @@
 
 封装入口：`retrieval_adapter.py`
 
-## PPR / Qwen3-VL Embedding Rerank
+## 证据取用（无 reranker）
 
-- `/mnt/data_1/yds/多模态/核心代码梳理/rerank_multimodal_ppr.py`
-- `/mnt/data_1/yds/多模态/核心代码梳理/run_rerank_background.sh`
-- `/mnt/data_1/yds/多模态/rerank/重排序/code/rerank_multimodal_ppr.py`
+新框架不再使用独立 reranker。粗召回 top20 后直接按 first-stage 检索分数取 top5（文本+图片混排）。
 
-封装入口：`rerank_adapter.py`
+封装入口：`evidence_selection.py`（`select_top_evidence` / `apply_selection`）。
+
+历史上的 PPR/Qwen3-VL-Embedding rerank 脚本（`核心代码梳理/rerank_multimodal_ppr.py` 等）已从本链路移除，仅作历史参考。
 
 ## 本地模型评测 / Generator
 
@@ -37,6 +37,6 @@
 ```text
 original_query/rewrite_query
  -> agentic_rag_pipeline.py
- -> retrieval_text / retrieval_image / reranked_evidence / generator_response / prediction
+ -> retrieval_text / retrieval_image / top5_evidence / generator_response / prediction
  -> reward annotation
 ```
